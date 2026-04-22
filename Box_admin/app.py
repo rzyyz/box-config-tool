@@ -4,14 +4,18 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import shlex
 import socket
 import subprocess
 import time
+import uuid
 from io import StringIO
 from collections import deque
 from pathlib import Path
 from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
 from urllib.parse import quote, unquote, urlparse, urlunparse
 
 from flask import Flask, jsonify, render_template, request
@@ -53,6 +57,28 @@ NETWORK_INTERFACE = os.getenv("BOX_ADMIN_INTERFACE", "")
 LOG_PATH = Path(os.getenv("BOX_ADMIN_LOG_PATH", "/tmp/box_admin.log"))
 DEFAULT_SIGNAL_CONTROLLER_HOST = os.getenv("BOX_ADMIN_DEFAULT_SIGNAL_HOST", "172.16.4.246")
 DEFAULT_SIGNAL_CONTROLLER_PORT = int(os.getenv("BOX_ADMIN_DEFAULT_SIGNAL_PORT", "40000"))
+STEP_TOOL_BASE_URL = os.getenv("BOX_ADMIN_STEP_TOOL_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
+STEP_TOOL_TIMEOUT = float(os.getenv("BOX_ADMIN_STEP_TOOL_TIMEOUT", "5"))
+CTRL_MODE_LABELS = {
+    0: "本地时段控制",
+    1: "关灯控制",
+    2: "黄闪控制",
+    3: "全红控制",
+    4: "定周期控制",
+    5: "协调绿波控制",
+    6: "协议红波控制",
+    7: "全感应控制",
+    8: "半感应控制",
+    9: "协调绿波全感应控制",
+    10: "步进控制",
+    12: "行人过街控制",
+    13: "单点自适应控制",
+    14: "静态干线控制",
+    15: "动态干线控制",
+    16: "区域优化控制",
+    17: "单点优化控制",
+    18: "公交优先控制",
+}
 
 
 def _parse_services() -> list[str]:
@@ -372,16 +398,81 @@ def parse_deepstream_sources(path: Path) -> list[dict[str, Any]]:
     return sources
 
 
+def find_deepstream_source_blocks(lines: list[str]) -> list[tuple[int, int, int]]:
+    blocks = []
+    index = 0
+    section_pattern = re.compile(r"\[[^\]]+\]\s*$")
+    source_pattern = re.compile(r"\[source(\d+)\]\s*$")
+    while index < len(lines):
+        match = source_pattern.match(lines[index].strip())
+        if not match:
+            index += 1
+            continue
+        source_index = int(match.group(1))
+        start = index
+        index += 1
+        while index < len(lines) and not section_pattern.match(lines[index].strip()):
+            index += 1
+        blocks.append((source_index, start, index))
+    return blocks
+
+
+def set_source_block_value(block: list[str], key: str, value: str) -> list[str]:
+    key_prefix = f"{key}="
+    output = []
+    replaced = False
+    for line in block:
+        if not replaced and line.strip().startswith(key_prefix):
+            output.append(f"{key}={value}")
+            replaced = True
+        else:
+            output.append(line)
+    if replaced:
+        return output
+    insert_at = len(output)
+    while insert_at > 1 and output[insert_at - 1].strip() == "":
+        insert_at -= 1
+    output.insert(insert_at, f"{key}={value}")
+    return output
+
+
+def build_deepstream_source_block(template: list[str], index: int, update: dict[str, Any]) -> list[str]:
+    if template:
+        block = list(template)
+        block[0] = f"[source{index}]"
+    else:
+        block = [
+            f"[source{index}]",
+            "enable=1",
+            "type=2",
+            "uri=",
+            "num-sources=1",
+            "gpu-id=0",
+            "cudadec-memtype=2",
+            "",
+        ]
+    block = set_source_block_value(block, "enable", "1" if update["enable"] else "0")
+    block = set_source_block_value(block, "uri", str(update["uri"]))
+    if block and block[-1].strip():
+        block.append("")
+    return block
+
+
 def update_deepstream_sources(path: Path, updates: list[dict[str, Any]]) -> None:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
     by_index = {int(item["index"]): item for item in updates}
+    blocks = find_deepstream_source_blocks(lines)
+    existing_indices = {index for index, _start, _end in blocks}
     current_section = None
     output = []
+    section_pattern = re.compile(r"\[([^\]]+)\]\s*$")
+    source_pattern = re.compile(r"source(\d+)$")
     for line in lines:
-        section_match = re.match(r"\[(source(\d+))\]\s*$", line.strip())
+        section_match = section_pattern.match(line.strip())
         if section_match:
-            current_section = int(section_match.group(2))
+            source_match = source_pattern.fullmatch(section_match.group(1))
+            current_section = int(source_match.group(1)) if source_match else None
             output.append(line)
             continue
         if current_section in by_index:
@@ -394,7 +485,38 @@ def update_deepstream_sources(path: Path, updates: list[dict[str, Any]]) -> None
                 output.append(f"uri={update['uri']}")
                 continue
         output.append(line)
+    new_indices = sorted(index for index in by_index if index not in existing_indices)
+    if new_indices:
+        updated_blocks = find_deepstream_source_blocks(output)
+        if updated_blocks:
+            _template_index, template_start, template_end = updated_blocks[-1]
+            template = output[template_start:template_end]
+            insert_at = template_end
+        else:
+            template = []
+            insert_at = len(output)
+        new_lines = []
+        for index in new_indices:
+            if index < 0:
+                raise ValueError("source id 不能为负数")
+            new_lines.extend(build_deepstream_source_block(template, index, by_index[index]))
+        output[insert_at:insert_at] = new_lines
     path.write_text("\n".join(output) + "\n", encoding="utf-8")
+
+
+def delete_deepstream_source(path: Path, index: int) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    sources = {item["index"]: item for item in parse_deepstream_sources(path)}
+    if index not in sources:
+        raise ValueError(f"source{index} 不存在")
+    for source_index, start, end in find_deepstream_source_blocks(lines):
+        if source_index != index:
+            continue
+        del lines[start:end]
+        path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return sources[index]
+    raise ValueError(f"source{index} 不存在")
 
 
 def parse_rtsp_target(uri: str) -> tuple[str | None, int | None]:
@@ -485,6 +607,76 @@ def check_rtsp_connectivity(uri: str) -> dict[str, Any]:
         sock.close()
 
 
+def sanitize_rtsp_error_message(message: str, uri: str) -> str:
+    text = message or ""
+    if uri:
+        text = text.replace(uri, "[RTSP地址]")
+    parsed = urlparse(uri)
+    if parsed.username and parsed.hostname:
+        auth_host = f"{parsed.username}"
+        if parsed.password:
+            auth_host += f":{parsed.password}"
+        auth_host += f"@{parsed.hostname}"
+        text = text.replace(auth_host, f"***@{parsed.hostname}")
+    return text
+
+
+def classify_rtsp_error(message: str) -> tuple[str, str]:
+    text = (message or "").lower()
+    if any(key in text for key in ["unauthorized", "401", "authentication", "not authorized", "permission denied"]):
+        return "auth_failed", "RTSP 认证失败，请检查相机账号或密码"
+    if any(key in text for key in ["404", "not found", "not-found"]):
+        return "path_failed", "RTSP 路径不存在，请检查视频流路径"
+    if any(key in text for key in ["timeout", "timed out", "connection timed out"]):
+        return "timeout", "视频流拉流超时，请检查网络、相机负载或 RTSP 地址"
+    if any(key in text for key in ["connection refused", "could not connect", "no route to host", "network is unreachable"]):
+        return "connect_failed", "无法连接相机视频流端口，请检查相机网络或端口"
+    if any(key in text for key in ["could not open resource", "open resource"]):
+        return "open_failed", "无法打开 RTSP 视频流，请检查地址、账号、密码或路径"
+    if "not-linked" in text:
+        return "no_video", "已连接到 RTSP，但未识别到视频流"
+    return "stream_failed", "视频流拉流失败，请检查账号、密码、路径和相机状态"
+
+
+def check_rtsp_stream(uri: str, timeout: int = 8) -> dict[str, Any]:
+    if not uri:
+        return {"ok": False, "reason": "empty_uri", "message": "RTSP 地址为空"}
+    parsed = urlparse(uri)
+    if parsed.scheme.lower() != "rtsp" or not parsed.hostname:
+        return {"ok": False, "reason": "invalid_uri", "message": "RTSP 地址格式无效"}
+
+    gst_launch = shutil.which("gst-launch-1.0")
+    if not gst_launch:
+        return {"ok": False, "reason": "missing_tool", "message": "缺少 gst-launch-1.0，无法按 DeepStream/GStreamer 链路验证拉流"}
+
+    cmd = [
+        gst_launch,
+        "-q",
+        "rtspsrc",
+        f"location={uri}",
+        "protocols=tcp",
+        "latency=200",
+        "timeout=5000000",
+        "!",
+        "application/x-rtp,media=video",
+        "!",
+        "fakesink",
+        "sync=false",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired:
+        return {"ok": True, "reason": "stream_ok", "message": "GStreamer 已持续接收视频流"}
+    if result.returncode == 0:
+        return {"ok": True, "reason": "stream_ok", "message": "GStreamer 拉流正常"}
+    raw_message = sanitize_rtsp_error_message((result.stderr or result.stdout or "GStreamer 拉流失败").strip(), uri)
+    reason, friendly_message = classify_rtsp_error(raw_message)
+    detail = raw_message[:200]
+    if detail and detail != friendly_message:
+        friendly_message = f"{friendly_message}；详情：{detail}"
+    return {"ok": False, "reason": reason, "message": friendly_message[:260]}
+
+
 def ping_host(host: str, count: int = 1) -> dict[str, Any]:
     if not host:
         return {"ok": False, "message": "未提供主机地址"}
@@ -522,6 +714,71 @@ def get_signal_checks(host: str, port: int, force: bool = False) -> tuple[dict[s
     tcp_result = tcp_check(host, port, timeout_sec=0.8)
     _SIGNAL_CHECK_CACHE = (now, host, port, ping_result, tcp_result)
     return ping_result, tcp_result
+
+
+def step_tool_request(path: str, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    url = f"{STEP_TOOL_BASE_URL}{path}"
+    headers = {"Accept": "application/json"}
+    data = None
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urlrequest.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urlrequest.urlopen(req, timeout=STEP_TOOL_TIMEOUT) as response:
+            raw = response.read().decode("utf-8")
+    except urlerror.URLError as exc:
+        raise RuntimeError(f"无法连接步进工具服务：{exc}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("连接步进工具服务超时") from exc
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("步进工具返回内容不是有效 JSON") from exc
+    if result.get("code") != 200:
+        raise RuntimeError(str(result.get("message") or "步进工具接口返回失败"))
+    return result
+
+
+def step_tool_upload(path: str, filename: str, content: bytes, mimetype: str) -> dict[str, Any]:
+    url = f"{STEP_TOOL_BASE_URL}{path}"
+    boundary = f"----box-config-tool-{uuid.uuid4().hex}"
+    safe_filename = Path(filename or "config.json").name.replace('"', "")
+    content_type = mimetype or "application/octet-stream"
+    body = b"".join(
+        [
+            f"--{boundary}\r\n".encode("utf-8"),
+            f'Content-Disposition: form-data; name="file"; filename="{safe_filename}"\r\n'.encode("utf-8"),
+            f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+            content,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]
+    )
+    req = urlrequest.Request(
+        url,
+        data=body,
+        headers={
+            "Accept": "application/json",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        },
+        method="POST",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=STEP_TOOL_TIMEOUT) as response:
+            raw = response.read().decode("utf-8")
+    except urlerror.URLError as exc:
+        raise RuntimeError(f"无法连接步进工具服务：{exc}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("连接步进工具服务超时") from exc
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("步进工具返回内容不是有效 JSON") from exc
+    if result.get("code") != 200:
+        raise RuntimeError(str(result.get("message") or "步进工具上传接口返回失败"))
+    return result
 
 
 def load_camera_aliases() -> dict[str, str]:
@@ -568,14 +825,64 @@ def build_camera_bindings() -> list[dict[str, Any]]:
     return cameras
 
 
+def camera_check_items_from_request() -> list[dict[str, Any]]:
+    body = request.get_json(silent=True) or {}
+    raw_items = body.get("items")
+    if not isinstance(raw_items, list):
+        return build_camera_bindings()
+
+    items = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            index = int(raw.get("index", len(items)))
+        except (TypeError, ValueError):
+            index = len(items)
+        host = str(raw.get("host", "")).strip()
+        username = str(raw.get("username", "")).strip()
+        password = str(raw.get("password", "")).strip()
+        path = str(raw.get("path", "/ch1/main")).strip() or "/ch1/main"
+        try:
+            port = int(raw.get("port", 554) or 554)
+        except (TypeError, ValueError):
+            port = 554
+        uri = str(raw.get("uri", "")).strip()
+        if not uri and host:
+            uri = generate_rtsp_uri(host, username, password, port, path)
+        if not host and uri:
+            parsed_host, parsed_port = parse_rtsp_target(uri)
+            host = parsed_host
+            port = parsed_port
+        items.append(
+            {
+                "index": index,
+                "name": str(raw.get("name", f"CAM_{index:02d}")),
+                "enable": bool(raw.get("enable", True)),
+                "host": host,
+                "port": port,
+                "uri": uri,
+            }
+        )
+    return items
+
+
 def save_camera_bindings(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     current_sources = {item["index"]: item for item in parse_deepstream_sources(DEEPSTREAM_CONFIG_PATH)}
     aliases = load_camera_aliases()
     updates = []
+    seen_indices = set()
     for item in items:
         idx = int(item["index"])
-        current = current_sources[idx]
-        uri = str(item.get("uri", current["uri"])).strip()
+        if idx < 0:
+            raise ValueError("source id 不能为负数")
+        if idx in seen_indices:
+            raise ValueError(f"source{idx} 重复，请刷新页面后重试")
+        seen_indices.add(idx)
+        current = current_sources.get(idx)
+        default_enable = current["enable"] if current else True
+        default_uri = current["uri"] if current else ""
+        uri = str(item.get("uri", default_uri)).strip()
         host = str(item.get("host", "")).strip()
         username = str(item.get("username", "")).strip()
         password = str(item.get("password", "")).strip()
@@ -589,7 +896,10 @@ def save_camera_bindings(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             raise ValueError(f"source{idx}.port 必须是数字")
         if host:
             uri = generate_rtsp_uri(host, username, password, port, path)
-        updates.append({"index": idx, "enable": bool(item.get("enable", current["enable"])), "uri": uri})
+        enable = bool(item.get("enable", default_enable))
+        if enable and not uri:
+            raise ValueError(f"source{idx} 启用时 RTSP 不能为空")
+        updates.append({"index": idx, "enable": enable, "uri": uri})
         aliases[str(idx)] = str(item.get("name", aliases.get(str(idx), f"CAM_{idx:02d}"))).strip() or f"CAM_{idx:02d}"
     update_deepstream_sources(DEEPSTREAM_CONFIG_PATH, updates)
     save_camera_aliases(aliases)
@@ -936,24 +1246,118 @@ def api_camera_bindings_save():
     items = body.get("items")
     if not isinstance(items, list):
         return jsonify({"ok": False, "message": "items 必须是数组"}), 400
+    before_sources = parse_deepstream_sources(DEEPSTREAM_CONFIG_PATH)
+    before_stream_map = {
+        int(item["index"]): {
+            "enable": bool(item["enable"]),
+            "uri": str(item["uri"]),
+        }
+        for item in before_sources
+    }
     try:
         cameras = save_camera_bindings(items)
     except ValueError as exc:
         return jsonify({"ok": False, "message": str(exc)}), 400
+    after_stream_map = {
+        int(item["index"]): {
+            "enable": bool(item["enable"]),
+            "uri": str(item["uri"]),
+        }
+        for item in parse_deepstream_sources(DEEPSTREAM_CONFIG_PATH)
+    }
+    stream_changed = before_stream_map != after_stream_map
+    restart_result = None
+    if stream_changed:
+        restart_result = run_command(["systemctl", "restart", "traffic_detect.service"], require_root=True, timeout=40)
+        if not restart_result["ok"]:
+            log_line("[CAMERA] 已更新相机绑定配置，但自动重启 traffic_detect.service 失败")
+            return jsonify(
+                {
+                    "ok": False,
+                    "message": restart_result["stderr"] or restart_result["stdout"] or "相机绑定已保存，但自动重启路口感知检测服务失败",
+                    "items": cameras,
+                    "stream_changed": stream_changed,
+                }
+            ), 500
     log_line("[CAMERA] 已更新相机绑定配置")
-    return jsonify({"ok": True, "message": "相机绑定已保存", "items": cameras})
+    message = "相机绑定已保存"
+    if stream_changed:
+        message = "相机绑定已保存，路口感知检测服务已自动重启"
+    return jsonify(
+        {
+            "ok": True,
+            "message": message,
+            "items": cameras,
+            "stream_changed": stream_changed,
+            "restart": restart_result,
+        }
+    )
+
+
+@app.post("/api/camera-bindings/<int:index>/delete")
+def api_camera_binding_delete(index: int):
+    if index < 0:
+        return jsonify({"ok": False, "message": "source id 不能为负数"}), 400
+    try:
+        deleted_source = delete_deepstream_source(DEEPSTREAM_CONFIG_PATH, index)
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 404
+    aliases = load_camera_aliases()
+    aliases.pop(str(index), None)
+    save_camera_aliases(aliases)
+    restart_result = run_command(["systemctl", "restart", "traffic_detect.service"], require_root=True, timeout=40)
+    cameras = build_camera_bindings()
+    if not restart_result["ok"]:
+        log_line(f"[CAMERA] 已彻底删除 source{index}，但自动重启 traffic_detect.service 失败")
+        return jsonify(
+            {
+                "ok": False,
+                "message": restart_result["stderr"] or restart_result["stdout"] or "source 已删除，但自动重启路口感知检测服务失败",
+                "items": cameras,
+                "deleted": deleted_source,
+            }
+        ), 500
+    log_line(f"[CAMERA] 已彻底删除 source{index}")
+    return jsonify(
+        {
+            "ok": True,
+            "message": f"source{index} 已彻底删除，路口感知检测服务已自动重启",
+            "items": cameras,
+            "deleted": deleted_source,
+            "restart": restart_result,
+        }
+    )
 
 
 @app.post("/api/camera-bindings/check")
 def api_camera_bindings_check():
-    items = build_camera_bindings()
+    items = camera_check_items_from_request()
     results = []
     for item in items:
         if not item["enable"]:
-            results.append({"index": item["index"], "ok": True, "message": "未启用，已跳过"})
+            results.append(
+                {
+                    "index": item["index"],
+                    "ok": True,
+                    "message": "未启用，已跳过",
+                    "ping": {"ok": True, "message": "未启用，已跳过"},
+                    "stream": {"ok": True, "message": "未启用，已跳过"},
+                }
+            )
             continue
-        result = tcp_check(item["host"], item["port"] or 554)
-        results.append({"index": item["index"], "name": item["name"], "host": item["host"], **result})
+        ping_result = ping_host(item["host"], count=1)
+        stream_result = check_rtsp_stream(item["uri"])
+        results.append(
+            {
+                "index": item["index"],
+                "name": item["name"],
+                "host": item["host"],
+                "uri": item["uri"],
+                "ok": bool(ping_result.get("ok") and stream_result.get("ok")),
+                "ping": ping_result,
+                "stream": stream_result,
+            }
+        )
     return jsonify({"ok": True, "results": results})
 
 
@@ -1052,6 +1456,118 @@ def api_signal_controller_save():
                 "ping": signal_ping,
                 "tcp": signal_tcp,
             },
+        }
+    )
+
+
+@app.get("/api/step-tool/status")
+def api_step_tool_status():
+    try:
+        result = step_tool_request("/api/v1/status")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc), "online": False}), 502
+    online = result.get("data") is True
+    return jsonify(
+        {
+            "ok": True,
+            "message": "步进工具在线" if online else "步进工具离线",
+            "online": online,
+            "raw": result,
+        }
+    )
+
+
+@app.post("/api/step-tool/tsc-config")
+def api_step_tool_tsc_config():
+    body = request.get_json(force=True)
+    host = str(body.get("ip") or body.get("host") or "").strip()
+    username = str(body.get("username") or "").strip()
+    password = str(body.get("password") or "")
+    port_raw = body.get("port")
+    try:
+        ensure_ipv4(host, "信号机 IP")
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+    if not username:
+        return jsonify({"ok": False, "message": "账户不能为空"}), 400
+    if not password:
+        return jsonify({"ok": False, "message": "密码不能为空"}), 400
+    try:
+        port = int(port_raw)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "端口号必须是数字"}), 400
+    if not (1 <= port <= 65535):
+        return jsonify({"ok": False, "message": "端口号超出范围"}), 400
+
+    try:
+        result = step_tool_request(
+            "/api/v1/tsc/config",
+            method="POST",
+            payload={"ip": host, "port": port, "username": username, "password": password},
+        )
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 502
+    success = result.get("data") is True
+    return jsonify(
+        {
+            "ok": success,
+            "message": "参数发送成功" if success else "参数发送失败",
+            "success": success,
+            "raw": result,
+        }
+    ), 200 if success else 502
+
+
+@app.get("/api/step-tool/tsc-status")
+def api_step_tool_tsc_status():
+    try:
+        result = step_tool_request("/api/v1/tsc/status")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 502
+    data = result.get("data") or {}
+    ctrl_mode = data.get("ctrlMode")
+    try:
+        ctrl_mode_id = int(ctrl_mode)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "步进工具返回的控制模式无效", "raw": result}), 502
+    label = CTRL_MODE_LABELS.get(ctrl_mode_id, f"未知控制模式 {ctrl_mode_id}")
+    return jsonify(
+        {
+            "ok": True,
+            "message": f"当前控制模式：{label}",
+            "ctrl_mode": ctrl_mode_id,
+            "ctrl_mode_label": label,
+            "raw": result,
+        }
+    )
+
+
+@app.post("/api/step-tool/tsc-config-upload")
+def api_step_tool_tsc_config_upload():
+    upload_file = request.files.get("file")
+    if upload_file is None:
+        return jsonify({"ok": False, "message": "请选择要上传的配置文件"}), 400
+    content = upload_file.read()
+    if not content:
+        return jsonify({"ok": False, "message": "配置文件内容为空"}), 400
+    try:
+        result = step_tool_upload(
+            "/api/v1/tsc/config/upload",
+            filename=upload_file.filename or "config.json",
+            content=content,
+            mimetype=upload_file.mimetype or "application/octet-stream",
+        )
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 502
+    data = result.get("data") or {}
+    filename = data.get("filename") or upload_file.filename or "配置文件"
+    size = data.get("size") or len(content)
+    return jsonify(
+        {
+            "ok": True,
+            "message": f"配置文件上传成功：{filename}（{size} 字节）",
+            "file": {"filename": filename, "size": size},
+            "raw": result,
         }
     )
 

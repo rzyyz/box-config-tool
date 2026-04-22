@@ -86,9 +86,10 @@
           </div>
           <article class="card">
             <div class="section-toolbar">
-              <div class="subtle">连通性检查会直接给出“正常 / 失败”的结果，方便现场快速判断相机是否能接入。</div>
+              <div class="subtle">检查分为 IP Ping 和视频流拉流。Ping 只说明相机地址可达，拉流会验证账号、密码和 RTSP 地址是否可用。</div>
               <div class="actions">
                 <button id="reloadCameraBtn" class="btn secondary">刷新列表</button>
+                <button id="addCameraBtn" class="btn secondary">新增相机</button>
                 <button id="checkCameraBtn" class="btn secondary">检查连通性</button>
                 <button id="saveCameraBtn" class="btn primary">保存绑定</button>
               </div>
@@ -103,9 +104,12 @@
                     <th>相机 IP</th>
                     <th>账号</th>
                     <th>密码</th>
+                    <th>端口</th>
                     <th>路径</th>
                     <th>RTSP URI</th>
-                    <th>状态</th>
+                    <th>IP Ping</th>
+                    <th>视频流拉流</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="cameraTableBody"></tbody>
@@ -133,24 +137,17 @@
         <section class="page-panel" data-page-key="runtime" data-page-title="运行状态">
           <div class="section-head">
             <h2>运行状态</h2>
-            <p>用于查看程序是否已经正常启动，以及信号机心跳是否正常。详细数据和信号机配置已拆到单独页面。</p>
+            <p>用于查看程序是否已经正常启动，并对关键服务执行刷新、启动、重启和暂停操作。</p>
           </div>
           <article class="card">
             <h3>服务快捷操作</h3>
             <p class="subtle">可直接查看关键服务当前状态，并执行刷新、启动、重启、暂停操作。</p>
             <div id="serviceQuickActions" class="status-cards"></div>
           </article>
-          <div class="card-grid two">
-            <article class="card">
-              <h3>服务状态</h3>
-              <div id="serviceList" class="status-cards"></div>
-            </article>
-            <article class="card">
-              <h3>信号机心跳检测</h3>
-              <p class="subtle">显示当前保存的信号机 IP 和端口是否可达。需要修改参数时，请进入“信号机设置”页面。</p>
-              <div id="signalRuntimeStatus" class="summary-list"></div>
-            </article>
-          </div>
+          <article class="card">
+            <h3>服务状态</h3>
+            <div id="serviceList" class="status-cards"></div>
+          </article>
         </section>
 
         <section class="page-panel" data-page-key="signal" data-page-title="信号机设置">
@@ -178,8 +175,72 @@
               </div>
             </article>
             <article class="card">
-              <h3>连通性结果</h3>
+              <h3>信号机心跳检测</h3>
+              <p class="subtle">显示当前保存的信号机 IP 和端口是否可达。修改参数后可立即检查，也可保存后让路口感知检测服务生效。</p>
               <div id="signalStatus" class="summary-list"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="page-panel" data-page-key="step-control" data-page-title="步进控制状态">
+          <div class="section-head">
+            <h2>步进控制状态</h2>
+            <p>用于查看步进工具是否在线，并把信号机连接参数发送给步进工具。接口接入后，操作结果会显示在本页。</p>
+          </div>
+          <div class="card-grid two">
+            <article class="card">
+              <h3>步进工具连接</h3>
+              <p class="subtle">检查本机步进工具服务是否在线，便于确认后续参数发送和同步操作是否可用。</p>
+              <div class="actions">
+                <button id="checkStepToolBtn" class="btn secondary">查询步进工具状态</button>
+              </div>
+              <div id="stepToolStatus" class="summary-list"></div>
+            </article>
+            <article class="card">
+              <h3>信号机连接参数</h3>
+              <p class="subtle">信号机 IP 会与“信号机设置”页面保持一致，任一页面修改后另一页同步更新。</p>
+              <div class="field-grid">
+                <label class="field">
+                  <span>信号机 IP</span>
+                  <input id="stepSignalHostInput" placeholder="例如 172.16.4.246">
+                </label>
+                <label class="field">
+                  <span>账户</span>
+                  <input id="stepUsernameInput" placeholder="例如 admin">
+                </label>
+                <label class="field">
+                  <span>密码</span>
+                  <input id="stepPasswordInput" type="password" placeholder="请输入密码">
+                </label>
+                <label class="field">
+                  <span>端口号</span>
+                  <input id="stepPortInput" placeholder="例如 80">
+                </label>
+              </div>
+              <div class="actions">
+                <button id="sendStepParamsBtn" class="btn primary">发送参数</button>
+              </div>
+              <div id="stepParamStatus" class="summary-list"></div>
+            </article>
+          </div>
+          <div class="card-grid two">
+            <article class="card">
+              <h3>信号机控制状态</h3>
+              <p class="subtle">获取步进工具返回的信号机控制状态，便于现场确认当前控制链路。</p>
+              <div class="actions">
+                <button id="fetchSignalControlStatusBtn" class="btn secondary">获取信号机控制状态</button>
+              </div>
+              <pre id="signalControlStatusOutput" class="log-box">尚未获取。</pre>
+            </article>
+            <article class="card">
+              <h3>配置同步与上传</h3>
+              <p class="subtle">同步结果会显示是否成功；上传时请选择已下载的信号机配置文件，系统会发送给步进工具。</p>
+              <div class="actions">
+                <button id="syncStepConfigBtn" class="btn secondary">同步</button>
+                <button id="uploadStepConfigBtn" class="btn primary">上传</button>
+                <input id="stepConfigFileInput" type="file" accept=".json,application/json" hidden>
+              </div>
+              <div id="stepSyncStatus" class="summary-list"></div>
             </article>
           </div>
         </section>

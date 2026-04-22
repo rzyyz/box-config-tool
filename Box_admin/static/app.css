@@ -328,6 +328,23 @@ input:focus, select:focus {
   color: #fff;
 }
 
+.btn.small {
+  padding: 7px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.btn.danger {
+  color: #fecaca;
+  border-color: rgba(248, 113, 113, 0.32);
+}
+
+.btn.danger:hover {
+  border-color: rgba(248, 113, 113, 0.72);
+  color: #fff;
+}
+
 .btn:disabled {
   cursor: not-allowed;
   opacity: 0.48;
@@ -339,6 +356,13 @@ input:focus, select:focus {
   align-items: center;
   gap: 12px;
   margin-bottom: 12px;
+}
+
+.row-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: nowrap;
 }
 
 .subtle {

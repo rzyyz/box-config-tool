@@ -57,6 +57,16 @@ function setGlobalStatus(ok, text) {
 }
 
 
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+
 async function activatePage(key) {
   panels.forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.pageKey === key);
@@ -120,21 +130,30 @@ function renderCameraBindings(items) {
   for (const item of items) {
     const row = document.createElement("tr");
     row.dataset.index = item.index;
+    row.dataset.isNew = item.isNew ? "1" : "0";
     row.innerHTML = `
       <td>${item.index}</td>
-      <td><input data-field="name" value="${item.name || ""}"></td>
+      <td><input data-field="name" value="${escapeHtml(item.name || "")}"></td>
       <td>
         <select data-field="enable">
           <option value="1" ${item.enable ? "selected" : ""}>启用</option>
           <option value="0" ${!item.enable ? "selected" : ""}>禁用</option>
         </select>
       </td>
-      <td><input data-field="host" value="${item.host || ""}" placeholder="192.168.x.x"></td>
-      <td><input data-field="username" value="${item.username || ""}" placeholder="admin"></td>
-      <td><input data-field="password" value="${item.password || ""}" placeholder="密码"></td>
-      <td><input data-field="path" value="${item.path || "/ch1/main"}" placeholder="/ch1/main"></td>
-      <td><input data-field="uri" value="${item.uri || ""}" placeholder="rtsp://..."></td>
-      <td><span class="badge ${item.enable ? "ok" : "warn"}">${item.enable ? "已启用" : "已禁用"}</span></td>
+      <td><input data-field="host" value="${escapeHtml(item.host || "")}" placeholder="192.168.x.x"></td>
+      <td><input data-field="username" value="${escapeHtml(item.username || "")}" placeholder="admin"></td>
+      <td><input data-field="password" value="${escapeHtml(item.password || "")}" placeholder="密码"></td>
+      <td><input data-field="port" value="${escapeHtml(item.port || 554)}" placeholder="554"></td>
+      <td><input data-field="path" value="${escapeHtml(item.path || "/ch1/main")}" placeholder="/ch1/main"></td>
+      <td><input data-field="uri" value="${escapeHtml(item.uri || "")}" placeholder="rtsp://..."></td>
+      <td data-check="ping"><span class="badge ${item.enable ? "warn" : "warn"}">${item.enable ? "未检查" : "已禁用"}</span></td>
+      <td data-check="stream"><span class="badge ${item.enable ? "warn" : "warn"}">${item.enable ? "未检查" : "已禁用"}</span></td>
+      <td>
+        <div class="row-actions">
+          <button class="btn secondary small camera-disable-btn" type="button">禁用</button>
+          <button class="btn secondary small danger camera-delete-btn" type="button">彻底删除</button>
+        </div>
+      </td>
     `;
     bindCameraRow(row);
     root.appendChild(row);
@@ -142,10 +161,38 @@ function renderCameraBindings(items) {
 }
 
 
+function nextCameraSourceId() {
+  const ids = Array.from(document.querySelectorAll("#cameraTableBody tr")).map((row) => Number(row.dataset.index));
+  const validIds = ids.filter((value) => Number.isFinite(value));
+  return validIds.length ? Math.max(...validIds) + 1 : 0;
+}
+
+
+function addCameraBindingRow() {
+  const sourceId = nextCameraSourceId();
+  const items = collectCameraBindings();
+  items.push({
+    index: sourceId,
+    name: `CAM_${String(sourceId).padStart(2, "0")}`,
+    enable: true,
+    host: "",
+    username: "admin",
+    password: "",
+    port: 554,
+    path: "/ch1/main",
+    uri: "",
+    isNew: true,
+  });
+  renderCameraBindings(items);
+  showToast(`已新增 source${sourceId}，填写相机信息后点击保存绑定。`, true);
+}
+
+
 function generateRtspUriFromRow(row) {
   const host = row.querySelector('[data-field="host"]').value.trim();
   const username = row.querySelector('[data-field="username"]').value.trim();
   const password = row.querySelector('[data-field="password"]').value.trim();
+  const port = Number(row.querySelector('[data-field="port"]')?.value.trim() || "554");
   const pathInput = row.querySelector('[data-field="path"]').value.trim() || "/ch1/main";
   if (!host) {
     return "";
@@ -159,9 +206,10 @@ function generateRtspUriFromRow(row) {
     if (normalizedPassword) {
       auth += `:${encodeURIComponent(normalizedPassword)}`;
     }
-    auth += "@";
-  }
-  return `rtsp://${auth}${host}${safePath}`;
+      auth += "@";
+    }
+  const portPart = Number.isFinite(port) && port !== 554 ? `:${port}` : "";
+  return `rtsp://${auth}${host}${portPart}${safePath}`;
 }
 
 
@@ -183,13 +231,42 @@ function bindCameraRow(row) {
     uriInput.dataset.manual = "1";
   });
 
-  ["host", "username", "password", "path"].forEach((field) => {
+  ["host", "username", "password", "port", "path"].forEach((field) => {
     row.querySelector(`[data-field="${field}"]`).addEventListener("input", () => {
       if (uriInput.dataset.manual === "1") {
         return;
       }
       uriInput.value = generateRtspUriFromRow(row);
     });
+  });
+
+  row.querySelector(".camera-disable-btn").addEventListener("click", () => {
+    row.querySelector('[data-field="enable"]').value = "0";
+    row.querySelector('[data-check="ping"]').innerHTML = '<span class="badge warn">待保存</span>';
+    row.querySelector('[data-check="stream"]').innerHTML = '<span class="badge warn">待保存</span>';
+    showToast(`source${row.dataset.index} 已标记为禁用，点击保存绑定后生效。`, true);
+  });
+
+  row.querySelector(".camera-delete-btn").addEventListener("click", async () => {
+    const sourceId = Number(row.dataset.index);
+    if (row.dataset.isNew === "1") {
+      row.remove();
+      showToast(`未保存的 source${sourceId} 已移除。`, true);
+      return;
+    }
+    const confirmed = window.confirm(`彻底删除 source${sourceId} 会从 DeepStream 配置中移除此 source，且不会重排其他 source id。是否继续？`);
+    if (!confirmed) {
+      return;
+    }
+    clearToast();
+    try {
+      const data = await fetchJson(`/api/camera-bindings/${encodeURIComponent(sourceId)}/delete`, { method: "POST" });
+      renderCameraBindings(data.items || []);
+      loadedPages.add("camera");
+      showToast(data.message, true);
+    } catch (error) {
+      showToast(error.message, false);
+    }
   });
 }
 
@@ -203,7 +280,7 @@ function collectCameraBindings() {
     username: row.querySelector('[data-field="username"]').value.trim(),
     password: row.querySelector('[data-field="password"]').value.trim(),
     path: row.querySelector('[data-field="path"]').value.trim(),
-    port: 554,
+    port: Number(row.querySelector('[data-field="port"]')?.value.trim() || "554"),
     uri: row.querySelector('[data-field="uri"]').value.trim(),
   }));
 }
@@ -284,9 +361,13 @@ function renderServiceQuickActions(services) {
 function renderSignalStatus(signal, rootId = "signalStatus", syncInputs = true) {
   const root = document.getElementById(rootId);
   const hostInput = document.getElementById("signalHostInput");
+  const stepHostInput = document.getElementById("stepSignalHostInput");
   const portInput = document.getElementById("signalPortInput");
   if (syncInputs && hostInput && document.activeElement !== hostInput) {
     hostInput.value = signal.host || "";
+  }
+  if (syncInputs && stepHostInput && document.activeElement !== stepHostInput) {
+    stepHostInput.value = signal.host || "";
   }
   if (syncInputs && portInput && document.activeElement !== portInput) {
     portInput.value = signal.port || "";
@@ -296,6 +377,76 @@ function renderSignalStatus(signal, rootId = "signalStatus", syncInputs = true) 
     <div class="summary-item"><span class="label">Ping</span><span class="value">${statusBadge(signal.ping.ok ? "ok" : "failed", signal.ping.ok ? "已连通" : "失败")}<div style="margin-top:8px;color:var(--muted);font-size:13px;">${signal.ping.message}</div></span></div>
     <div class="summary-item"><span class="label">TCP</span><span class="value">${statusBadge(signal.tcp.ok ? "ok" : "failed", signal.tcp.ok ? "端口可达" : "失败")}<div style="margin-top:8px;color:var(--muted);font-size:13px;">${signal.tcp.message}</div></span></div>
   `);
+}
+
+
+function syncSignalHostInputs(value, sourceId) {
+  ["signalHostInput", "stepSignalHostInput"].forEach((id) => {
+    const input = document.getElementById(id);
+    if (!input || id === sourceId || document.activeElement === input) {
+      return;
+    }
+    input.value = value;
+  });
+}
+
+
+function renderStepStatus(rootId, status, title, message) {
+  const root = document.getElementById(rootId);
+  if (!root) {
+    return;
+  }
+  setHtmlIfChanged(root, `
+    <div class="summary-item">
+      <span class="label">${title}</span>
+      <span class="value">${statusBadge(status, message)}</span>
+    </div>
+  `);
+}
+
+
+function renderStepControlPage() {
+  const signalHost = document.getElementById("signalHostInput")?.value || window.BOX_ADMIN_BOOTSTRAP?.signalHost || "";
+  const stepHostInput = document.getElementById("stepSignalHostInput");
+  const stepUsernameInput = document.getElementById("stepUsernameInput");
+  const stepPortInput = document.getElementById("stepPortInput");
+  if (stepHostInput && document.activeElement !== stepHostInput) {
+    stepHostInput.value = signalHost;
+  }
+  if (stepUsernameInput && !stepUsernameInput.value) {
+    stepUsernameInput.value = "admin";
+  }
+  if (stepPortInput && !stepPortInput.value) {
+    stepPortInput.value = "80";
+  }
+  renderStepStatus("stepToolStatus", "inactive", "步进工具", "尚未查询");
+  renderStepStatus("stepParamStatus", "inactive", "参数发送", "等待发送");
+  renderStepStatus("stepSyncStatus", "inactive", "同步 / 上传", "尚未操作");
+}
+
+
+function streamCheckLabel(stream) {
+  if (stream.ok) {
+    return "拉流成功";
+  }
+  const labels = {
+    auth_failed: "账号或密码错误",
+    path_failed: "路径错误",
+    timeout: "拉流超时",
+    connect_failed: "连接失败",
+    open_failed: "无法打开",
+    no_video: "无视频流",
+    invalid_uri: "地址错误",
+    empty_uri: "地址为空",
+    missing_tool: "工具缺失",
+  };
+  return labels[stream.reason] || "拉流失败";
+}
+
+
+function showStepPending(rootId, title) {
+  renderStepStatus(rootId, "warning", title, "接口格式待接入");
+  showToast(`${title}接口待接入`, false);
 }
 
 
@@ -442,7 +593,6 @@ async function loadRuntimeSummary() {
   renderServiceStatus(summary.services || []);
   renderServiceQuickActions(summary.services || []);
   const signal = summary.signal_controller || { host: "-", port: "-", ping: {}, tcp: {} };
-  renderSignalStatus(signal, "signalRuntimeStatus", false);
   renderSignalStatus(signal, "signalStatus", true);
 }
 
@@ -470,6 +620,8 @@ async function loadPageData(key, force = false) {
     await loadCalibrationStatus();
   } else if (key === "runtime" || key === "signal") {
     await loadRuntimeSummary();
+  } else if (key === "step-control") {
+    renderStepControlPage();
   } else if (key === "data-check") {
     if (force) {
       await loadDataSummary();
@@ -528,6 +680,11 @@ function wireActions() {
     }
   });
 
+  document.getElementById("addCameraBtn").addEventListener("click", () => {
+    clearToast();
+    addCameraBindingRow();
+  });
+
   document.getElementById("saveCameraBtn").addEventListener("click", async () => {
     clearToast();
     try {
@@ -547,18 +704,32 @@ function wireActions() {
   document.getElementById("checkCameraBtn").addEventListener("click", async () => {
     clearToast();
     try {
-      const data = await fetchJson("/api/camera-bindings/check", { method: "POST" });
+      const data = await fetchJson("/api/camera-bindings/check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: collectCameraBindings() }),
+      });
       const resultMap = new Map((data.results || []).map((item) => [String(item.index), item]));
       Array.from(document.querySelectorAll("#cameraTableBody tr")).forEach((row) => {
         const result = resultMap.get(row.dataset.index);
-        const cell = row.lastElementChild;
         if (!result) {
           return;
         }
-        cell.innerHTML = `<span class="badge ${result.ok ? "ok" : "err"}">${result.ok ? "连接正常" : "连接失败"}</span>`;
+        const pingCell = row.querySelector('[data-check="ping"]');
+        const streamCell = row.querySelector('[data-check="stream"]');
+        const ping = result.ping || {};
+        const stream = result.stream || {};
+        pingCell.innerHTML = `
+          <span class="badge ${ping.ok ? "ok" : "err"}">${ping.ok ? "可达" : "失败"}</span>
+          <div style="margin-top:6px;color:var(--muted);font-size:12px;">${ping.message || "-"}</div>
+        `;
+        streamCell.innerHTML = `
+          <span class="badge ${stream.ok ? "ok" : "err"}">${streamCheckLabel(stream)}</span>
+          <div style="margin-top:6px;color:var(--muted);font-size:12px;">${stream.message || "-"}</div>
+        `;
       });
       const hasFailure = (data.results || []).some((item) => !item.ok);
-      showToast(hasFailure ? "检查完成：有相机连接失败，请看表格红色结果。" : "检查完成：所有启用相机连接正常。", !hasFailure);
+      showToast(hasFailure ? "检查完成：有相机 Ping 或视频流拉流失败，请看表格红色结果。" : "检查完成：所有启用相机 Ping 和视频流拉流正常。", !hasFailure);
     } catch (error) {
       showToast(error.message, false);
     }
@@ -584,6 +755,14 @@ function wireActions() {
     }
   });
 
+  ["signalHostInput", "stepSignalHostInput"].forEach((id) => {
+    const input = document.getElementById(id);
+    if (!input) {
+      return;
+    }
+    input.addEventListener("input", () => syncSignalHostInputs(input.value.trim(), id));
+  });
+
   document.getElementById("checkSignalBtn").addEventListener("click", async () => {
     clearToast();
     try {
@@ -596,12 +775,96 @@ function wireActions() {
         }),
       });
       renderSignalStatus(data.signal_controller || {}, "signalStatus", false);
-      renderSignalStatus(data.signal_controller || {}, "signalRuntimeStatus", false);
       loadedPages.delete("runtime");
       loadedPages.delete("signal");
       showToast(data.message, data.signal_controller?.ping?.ok && data.signal_controller?.tcp?.ok);
     } catch (error) {
       showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("checkStepToolBtn").addEventListener("click", async () => {
+    clearToast();
+    try {
+      const data = await fetchJson("/api/step-tool/status");
+      renderStepStatus("stepToolStatus", data.online ? "ok" : "failed", "步进工具", data.message);
+      showToast(data.message, data.online);
+    } catch (error) {
+      renderStepStatus("stepToolStatus", "failed", "步进工具", error.message);
+      showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("sendStepParamsBtn").addEventListener("click", async () => {
+    clearToast();
+    const host = document.getElementById("stepSignalHostInput").value.trim();
+    const username = document.getElementById("stepUsernameInput").value.trim();
+    const password = document.getElementById("stepPasswordInput").value;
+    const port = document.getElementById("stepPortInput").value.trim();
+    if (!host || !username || !password || !port) {
+      renderStepStatus("stepParamStatus", "failed", "参数发送", "请先填写信号机 IP、账户、密码和端口号");
+      showToast("请先填写完整参数", false);
+      return;
+    }
+    try {
+      const data = await fetchJson("/api/step-tool/tsc-config", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ip: host, username, password, port }),
+      });
+      renderStepStatus("stepParamStatus", data.success ? "ok" : "failed", "参数发送", data.message);
+      showToast(data.message, data.success);
+    } catch (error) {
+      renderStepStatus("stepParamStatus", "failed", "参数发送", error.message);
+      showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("fetchSignalControlStatusBtn").addEventListener("click", async () => {
+    clearToast();
+    try {
+      const data = await fetchJson("/api/step-tool/tsc-status");
+      document.getElementById("signalControlStatusOutput").textContent = `控制模式：${data.ctrl_mode_label}（${data.ctrl_mode}）`;
+      showToast(data.message, true);
+    } catch (error) {
+      document.getElementById("signalControlStatusOutput").textContent = error.message;
+      showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("syncStepConfigBtn").addEventListener("click", () => {
+    clearToast();
+    showStepPending("stepSyncStatus", "配置同步");
+  });
+
+  document.getElementById("uploadStepConfigBtn").addEventListener("click", () => {
+    clearToast();
+    document.getElementById("stepConfigFileInput").click();
+  });
+
+  document.getElementById("stepConfigFileInput").addEventListener("change", async (event) => {
+    clearToast();
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    const formData = new FormData();
+    formData.append("file", file);
+    try {
+      renderStepStatus("stepSyncStatus", "warning", "配置上传", "正在上传配置文件...");
+      const data = await fetchJson("/api/step-tool/tsc-config-upload", {
+        method: "POST",
+        body: formData,
+      });
+      const filename = data.file?.filename || file.name;
+      const size = data.file?.size ?? file.size;
+      renderStepStatus("stepSyncStatus", "ok", "配置上传", `${filename}（${size} 字节）上传成功`);
+      showToast(data.message || "配置文件上传成功", true);
+    } catch (error) {
+      renderStepStatus("stepSyncStatus", "failed", "配置上传", error.message);
+      showToast(error.message, false);
+    } finally {
+      event.target.value = "";
     }
   });
 
@@ -617,7 +880,6 @@ function wireActions() {
         }),
       });
       renderSignalStatus(data.signal_controller || {}, "signalStatus", true);
-      renderSignalStatus(data.signal_controller || {}, "signalRuntimeStatus", false);
       showToast(data.message, true);
       loadedPages.delete("runtime");
       loadedPages.delete("signal");

@@ -49,6 +49,7 @@ box_config_tool/
 ├── DeepStream-Yolo/
 │   └── deepstream_app_config.txt      # 视频源 RTSP 配置文件
 ├── scripts/
+│   ├── install_onekey.sh              # 正式交付一键安装、开机自启和启动
 │   ├── install_manual_services.sh     # 安装服务，但默认不开机自启
 │   ├── disable_all_autostart.sh       # 关闭项目服务自启和定时重启
 │   ├── install_daily_reboot_timer.sh  # 安装每天 03:30 自动重启
@@ -77,6 +78,7 @@ Box_admin/static/app.js
 - `画面标定`：当前先检查标定文件是否齐全，后续可接入真正标定页面。
 - `运行状态`：查看服务状态、服务启停、重启后自动启动开关、信号机心跳摘要。
 - `信号机设置`：配置和检查信号机 IP、端口，保存后自动重启路口感知检测服务。
+- `步进控制状态`：查看步进工具状态、发送信号机连接参数、获取控制状态、同步配置，并可跳转到信号机页面由操作人员手动下载配置文件。
 - `数据检测`：显示全部车道的车流、车头时距、排队长度，以及近期异常日志。
 
 ## 3. 新增页面方法
@@ -197,6 +199,62 @@ sudo systemctl start config_agent.service
 开发板调试阶段不要随便启动 `traffic_detect.service`，它会拉 DeepStream，配置不对时可能造成桌面卡顿或黑屏。
 
 ## 7. 部署与安全约定
+
+正式交付盒子推荐使用一键脚本。盒子需已预装 DeepStream、CUDA/TensorRT，工程根目录放入 `Miniforge3-Linux-aarch64.sh`，并准备好已安装依赖的 conda 环境或本地 Python wheels。
+
+如果当前账号不是 `nvidia`，脚本会默认使用当前账号作为服务运行用户，并把正式目录设为：
+
+```bash
+~/Project/box_config_tool
+```
+
+如果你把整包先放在下载目录或 U 盘目录运行，脚本会自动创建上面的正式目录，并把整包复制过去再安装。也可以直接先复制到正式目录后运行：
+
+```bash
+cd /home/nvidia/Project/box_config_tool
+chmod +x scripts/install_onekey.sh
+bash scripts/install_onekey.sh
+```
+
+一键脚本默认会：
+
+- 安装 Miniforge 到当前用户的 `~/miniforge3`，如果已存在则跳过。
+- 自动创建 `~/Project/box_config_tool`，并在需要时把当前安装包复制到该目录。
+- 优先使用 `yolo11_py310` conda 环境；如果不存在，会尝试离线创建，失败后使用 `base`。
+- 检查 `flask`、`fastapi`、`uvicorn`、`flask_cors`，缺少时从 `python_wheels/`、`wheels/`、`offline_wheels/`、`packages/` 或 `PIP_WHEEL_DIR` 指定目录离线安装。
+- 安装 `box_admin.service`、`config_agent.service`、`traffic_detect.service`。
+- 安装最小 sudoers，让页面可以执行网卡修改和服务启停。
+- 默认开启三个服务的开机自启，并立即启动三个服务。
+- 如桌面存在 `~/Desktop`，自动安装“盒子配置工具”桌面图标。
+
+常用可选项：
+
+```bash
+# 只安装和自启服务，但本次不启动 traffic_detect 重服务
+START_TRAFFIC=0 bash scripts/install_onekey.sh
+
+# 安装服务但不设置开机自启
+ENABLE_AUTOSTART=0 bash scripts/install_onekey.sh
+
+# 指定离线 Python wheel 目录
+PIP_WHEEL_DIR=/home/nvidia/offline_wheels bash scripts/install_onekey.sh
+
+# 指定服务运行用户和正式部署目录
+SERVICE_USER=box TARGET_PROJECT_ROOT=/home/box/Project/box_config_tool bash scripts/install_onekey.sh
+
+# 只在当前目录安装，不复制到 ~/Project/box_config_tool
+AUTO_INSTALL_TO_TARGET=0 bash scripts/install_onekey.sh
+
+# 最终交付盒子同时启用每天 03:30 自动重启
+INSTALL_DAILY_REBOOT=1 bash scripts/install_onekey.sh
+```
+
+一键安装完成后访问：
+
+```text
+http://127.0.0.1:8090
+http://<盒子IP>:8090
+```
 
 安装服务：
 
