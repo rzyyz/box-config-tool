@@ -2,6 +2,8 @@ const toast = document.getElementById("toast");
 const panels = Array.from(document.querySelectorAll(".page-panel"));
 const navRoot = document.getElementById("sidebarNav");
 const htmlCache = new Map();
+const loadedPages = new Set();
+let activePageKey = panels.find((panel) => panel.classList.contains("active"))?.dataset.pageKey || "network";
 
 
 function showToast(message, ok = true) {
@@ -55,13 +57,19 @@ function setGlobalStatus(ok, text) {
 }
 
 
-function activatePage(key) {
+async function activatePage(key) {
   panels.forEach((panel) => {
     panel.classList.toggle("active", panel.dataset.pageKey === key);
   });
   Array.from(navRoot.querySelectorAll(".nav-item")).forEach((button) => {
     button.classList.toggle("active", button.dataset.target === key);
   });
+  activePageKey = key;
+  try {
+    await loadPageData(key);
+  } catch (error) {
+    showToast(error.message, false);
+  }
 }
 
 
@@ -291,24 +299,99 @@ function renderSignalStatus(signal, rootId = "signalStatus", syncInputs = true) 
 }
 
 
-function renderMetricList(rootId, payload, unit) {
-  const root = document.getElementById(rootId);
-  const top = payload.top || [];
-  if (!top.length) {
-    setHtmlIfChanged(root, `<div class="metric-item"><span class="label">暂无数据</span><div class="value">${payload.file || "未找到对应文件"}</div></div>`);
+function metricMap(payload) {
+  return new Map((payload?.top || []).map((item) => [String(item.lane), item.value]));
+}
+
+
+function laneSortKey(lane) {
+  const num = Number(lane);
+  return Number.isFinite(num) ? num : String(lane);
+}
+
+
+function collectMetricLanes(metrics) {
+  const lanes = new Set();
+  ["flow", "headway", "queue"].forEach((key) => {
+    (metrics?.[key]?.top || []).forEach((item) => lanes.add(String(item.lane)));
+  });
+  return Array.from(lanes).sort((a, b) => {
+    const ak = laneSortKey(a);
+    const bk = laneSortKey(b);
+    if (typeof ak === "number" && typeof bk === "number") {
+      return ak - bk;
+    }
+    return String(a).localeCompare(String(b));
+  });
+}
+
+
+function renderLatestMetricTable(metrics) {
+  const table = document.getElementById("latestMetricTable");
+  const meta = document.getElementById("latestMetricMeta");
+  const lanes = collectMetricLanes(metrics || {});
+  if (!lanes.length) {
+    setHtmlIfChanged(table, `<tbody><tr><td>暂无车道数据</td></tr></tbody>`);
+    meta.textContent = "未找到最新 CSV 数据。";
     return;
   }
-  setHtmlIfChanged(root, top.map((item) => `
-    <div class="metric-item">
-      <span class="label">车道 ${item.lane}</span>
-      <div class="value">${item.value}${unit}</div>
-    </div>
-  `).join("") + `
-    <div class="metric-item">
-      <span class="label">最近时间</span>
-      <div class="value">${payload.updated_at || "-"}</div>
-    </div>
-  `);
+  const flow = metricMap(metrics.flow);
+  const headway = metricMap(metrics.headway);
+  const queue = metricMap(metrics.queue);
+  const rows = [
+    { label: "最新车流", unit: "", values: flow },
+    { label: "车头时距", unit: " s", values: headway },
+    { label: "排队长度", unit: " m", values: queue },
+  ];
+  const html = `
+    <thead>
+      <tr>
+        <th>数据项</th>
+        ${lanes.map((lane) => `<th>车道 ${lane}</th>`).join("")}
+      </tr>
+    </thead>
+    <tbody>
+      ${rows.map((row) => `
+        <tr>
+          <td>${row.label}</td>
+          ${lanes.map((lane) => `<td>${row.values.has(lane) ? `${row.values.get(lane)}${row.unit}` : "-"}</td>`).join("")}
+        </tr>
+      `).join("")}
+    </tbody>
+  `;
+  setHtmlIfChanged(table, html);
+  const latestTimes = [metrics.flow?.updated_at, metrics.headway?.updated_at, metrics.queue?.updated_at].filter(Boolean);
+  meta.textContent = latestTimes.length ? `最近时间：${latestTimes[0]}` : "已读取最新车道数据。";
+}
+
+
+function renderHourlyFlowStats(flowWindow) {
+  const table = document.getElementById("hourlyFlowTable");
+  const meta = document.getElementById("hourlyFlowMeta");
+  const lanes = flowWindow?.lanes || [];
+  if (!lanes.length) {
+    setHtmlIfChanged(table, `<tbody><tr><td>暂无统计数据</td></tr></tbody>`);
+    meta.textContent = flowWindow?.file ? "未找到可统计的车流记录。" : "未找到车流 CSV 文件。";
+    return;
+  }
+  const html = `
+    <thead>
+      <tr>
+        <th>统计项</th>
+        ${lanes.map((lane) => `<th>车道 ${lane}</th>`).join("")}
+        <th>合计</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>累计流量</td>
+        ${lanes.map((lane) => `<td>${flowWindow.by_lane?.[lane] ?? 0}</td>`).join("")}
+        <td>${flowWindow.total ?? 0}</td>
+      </tr>
+    </tbody>
+  `;
+  setHtmlIfChanged(table, html);
+  meta.textContent = `统计最近 ${flowWindow.hours} 小时，使用 ${flowWindow.rows || 0} 条记录。`;
 }
 
 
@@ -361,10 +444,40 @@ async function loadRuntimeSummary() {
   const signal = summary.signal_controller || { host: "-", port: "-", ping: {}, tcp: {} };
   renderSignalStatus(signal, "signalRuntimeStatus", false);
   renderSignalStatus(signal, "signalStatus", true);
-  renderMetricList("flowMetrics", summary.metrics?.flow || {}, "");
-  renderMetricList("headwayMetrics", summary.metrics?.headway || {}, " s");
-  renderMetricList("queueMetrics", summary.metrics?.queue || {}, " m");
+}
+
+
+async function loadDataSummary() {
+  const hoursInput = document.getElementById("dataHoursInput");
+  const hours = hoursInput ? hoursInput.value.trim() || "1" : "1";
+  const data = await fetchJson(`/api/data-summary?hours=${encodeURIComponent(hours)}`);
+  const summary = data.summary || {};
+  renderLatestMetricTable(summary.metrics || {});
+  renderHourlyFlowStats(summary.flow_window || {});
   renderRecentEvents(summary.recent_events || []);
+}
+
+
+async function loadPageData(key, force = false) {
+  if (!force && loadedPages.has(key)) {
+    return;
+  }
+  if (key === "network") {
+    await loadStatus();
+  } else if (key === "camera") {
+    await loadCameraBindings();
+  } else if (key === "calibration") {
+    await loadCalibrationStatus();
+  } else if (key === "runtime" || key === "signal") {
+    await loadRuntimeSummary();
+  } else if (key === "data-check") {
+    if (force) {
+      await loadDataSummary();
+    } else {
+      renderRecentEvents([]);
+    }
+  }
+  loadedPages.add(key);
 }
 
 
@@ -372,8 +485,9 @@ function wireActions() {
   document.getElementById("refreshAllBtn").addEventListener("click", async () => {
     clearToast();
     try {
-      await Promise.all([loadStatus(), loadCameraBindings(), loadCalibrationStatus(), loadRuntimeSummary()]);
-      showToast("已刷新全部页面数据", true);
+      loadedPages.delete(activePageKey);
+      await loadPageData(activePageKey, true);
+      showToast("已刷新当前页面数据", true);
     } catch (error) {
       showToast(error.message, false);
     }
@@ -397,6 +511,7 @@ function wireActions() {
       });
       showToast(data.message, true);
       await loadStatus();
+      loadedPages.add("network");
     } catch (error) {
       showToast(error.message, false);
     }
@@ -406,6 +521,7 @@ function wireActions() {
     clearToast();
     try {
       await loadCameraBindings();
+      loadedPages.add("camera");
       showToast("相机配置已刷新", true);
     } catch (error) {
       showToast(error.message, false);
@@ -421,6 +537,7 @@ function wireActions() {
         body: JSON.stringify({ items: collectCameraBindings() }),
       });
       renderCameraBindings(data.items || []);
+      loadedPages.add("camera");
       showToast(data.message, true);
     } catch (error) {
       showToast(error.message, false);
@@ -456,6 +573,17 @@ function wireActions() {
     }
   });
 
+  document.getElementById("refreshDataBtn").addEventListener("click", async () => {
+    clearToast();
+    try {
+      await loadDataSummary();
+      loadedPages.add("data-check");
+      showToast("数据检测已刷新", true);
+    } catch (error) {
+      showToast(error.message, false);
+    }
+  });
+
   document.getElementById("checkSignalBtn").addEventListener("click", async () => {
     clearToast();
     try {
@@ -469,6 +597,8 @@ function wireActions() {
       });
       renderSignalStatus(data.signal_controller || {}, "signalStatus", false);
       renderSignalStatus(data.signal_controller || {}, "signalRuntimeStatus", false);
+      loadedPages.delete("runtime");
+      loadedPages.delete("signal");
       showToast(data.message, data.signal_controller?.ping?.ok && data.signal_controller?.tcp?.ok);
     } catch (error) {
       showToast(error.message, false);
@@ -489,7 +619,11 @@ function wireActions() {
       renderSignalStatus(data.signal_controller || {}, "signalStatus", true);
       renderSignalStatus(data.signal_controller || {}, "signalRuntimeStatus", false);
       showToast(data.message, true);
-      await Promise.all([loadStatus(), loadRuntimeSummary()]);
+      loadedPages.delete("runtime");
+      loadedPages.delete("signal");
+      await loadRuntimeSummary();
+      loadedPages.add("runtime");
+      loadedPages.add("signal");
     } catch (error) {
       showToast(error.message, false);
     }
@@ -501,7 +635,7 @@ async function boot() {
   buildNavigation();
   wireActions();
   try {
-    await Promise.all([loadStatus(), loadCameraBindings(), loadCalibrationStatus(), loadRuntimeSummary()]);
+    await loadPageData(activePageKey);
   } catch (error) {
     showToast(error.message, false);
   }

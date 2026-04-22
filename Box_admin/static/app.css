@@ -278,6 +278,19 @@ input:focus, select:focus {
   box-shadow: 0 0 0 3px rgba(245, 158, 11, 0.15);
 }
 
+.inline-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.inline-field input {
+  width: 86px;
+  padding: 9px 10px;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -361,6 +374,25 @@ input:focus, select:focus {
 .data-table td input,
 .data-table td select {
   min-width: 120px;
+}
+
+.compact-table {
+  min-width: 760px;
+}
+
+.compact-table th,
+.compact-table td {
+  text-align: center;
+  white-space: nowrap;
+}
+
+.compact-table th:first-child,
+.compact-table td:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  text-align: left;
+  background: rgba(15, 23, 42, 0.96);
 }
 
 .badge {

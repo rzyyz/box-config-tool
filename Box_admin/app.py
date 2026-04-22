@@ -8,6 +8,7 @@ import shlex
 import socket
 import subprocess
 import time
+from io import StringIO
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -602,15 +603,36 @@ def latest_csv_file(prefix: str) -> Path | None:
     return max(files, key=lambda path: path.stat().st_mtime)
 
 
+def read_csv_tail_rows(path: Path, max_lines: int = 12) -> tuple[str, list[str]]:
+    with path.open("rb") as handle:
+        header = handle.readline().decode("utf-8", errors="ignore").strip()
+        handle.seek(0, os.SEEK_END)
+        pos = handle.tell()
+        tail = b""
+        block_size = 8192
+        while pos > 0 and tail.count(b"\n") <= max_lines:
+            read_size = min(block_size, pos)
+            pos -= read_size
+            handle.seek(pos)
+            tail = handle.read(read_size) + tail
+    rows = [line for line in tail.decode("utf-8", errors="ignore").splitlines() if line.strip()]
+    if rows and rows[0].strip() == header:
+        rows = rows[1:]
+    return header, rows[-max_lines:]
+
+
 def read_latest_csv_summary(prefix: str) -> dict[str, Any]:
     path = latest_csv_file(prefix)
     if path is None:
         return {"file": None, "updated_at": None, "top": []}
-    last_row = None
-    with path.open("r", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            last_row = row
+    try:
+        header, data_lines = read_csv_tail_rows(path, max_lines=8)
+        if not data_lines:
+            return {"file": str(path), "updated_at": None, "top": []}
+        reader = csv.DictReader(StringIO(header + "\n" + data_lines[-1] + "\n"))
+        last_row = next(reader, None)
+    except Exception as exc:
+        return {"file": str(path), "updated_at": None, "top": [], "error": str(exc)}
     if not last_row:
         return {"file": str(path), "updated_at": None, "top": []}
     metrics = []
@@ -635,14 +657,87 @@ def read_latest_csv_summary(prefix: str) -> dict[str, Any]:
     }
 
 
+def read_flow_window_summary(hours: float) -> dict[str, Any]:
+    safe_hours = max(0.1, min(float(hours or 1), 24.0))
+    path = latest_csv_file("flow")
+    if path is None:
+        return {"file": None, "hours": safe_hours, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
+    max_lines = min(max(int(safe_hours * 3700) + 30, 400), 100000)
+    try:
+        header, data_lines = read_csv_tail_rows(path, max_lines=max_lines)
+        if not data_lines:
+            return {"file": str(path), "hours": safe_hours, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
+        reader = csv.DictReader(StringIO(header + "\n" + "\n".join(data_lines) + "\n"))
+        rows = list(reader)
+        latest_ts = None
+        for row in reversed(rows):
+            try:
+                latest_ts = float(row.get("ts", ""))
+                break
+            except (TypeError, ValueError):
+                continue
+        if latest_ts is None:
+            return {"file": str(path), "hours": safe_hours, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
+        start_ts = latest_ts - safe_hours * 3600
+        sums: dict[str, float] = {}
+        used_rows = 0
+        for row in rows:
+            try:
+                row_ts = float(row.get("ts", ""))
+            except (TypeError, ValueError):
+                continue
+            if row_ts < start_ts:
+                continue
+            used_rows += 1
+            for key, value in row.items():
+                if not key.startswith("lane_"):
+                    continue
+                lane = key.replace("lane_", "")
+                try:
+                    sums[lane] = sums.get(lane, 0.0) + float(value or 0)
+                except (TypeError, ValueError):
+                    continue
+
+        def lane_sort_key(lane: str) -> tuple[int, Any]:
+            return (0, int(lane)) if lane.isdigit() else (1, lane)
+
+        lanes = sorted(sums.keys(), key=lane_sort_key)
+        by_lane = {lane: round(sums[lane], 2) for lane in lanes}
+        total = round(sum(by_lane.values()), 2)
+        return {
+            "file": str(path),
+            "hours": safe_hours,
+            "lanes": lanes,
+            "by_lane": by_lane,
+            "total": total,
+            "rows": used_rows,
+            "start_ts": start_ts,
+            "end_ts": latest_ts,
+        }
+    except Exception as exc:
+        return {"file": str(path), "hours": safe_hours, "lanes": [], "by_lane": {}, "total": 0, "rows": 0, "error": str(exc)}
+
+
 def read_recent_log_events(limit: int = 12) -> list[str]:
     path = TRAFFIC_LOG_DIR / "runtime_main.log"
     if not path.exists():
         return []
     lines: deque[str] = deque(maxlen=200)
-    with path.open("r", encoding="utf-8", errors="ignore") as handle:
-        for line in handle:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            pos = handle.tell()
+            tail = b""
+            block_size = 8192
+            while pos > 0 and tail.count(b"\n") <= 400:
+                read_size = min(block_size, pos)
+                pos -= read_size
+                handle.seek(pos)
+                tail = handle.read(read_size) + tail
+        for line in tail.decode("utf-8", errors="ignore").splitlines():
             lines.append(line.rstrip())
+    except Exception as exc:
+        return [f"读取日志失败: {exc}"]
     interesting = [
         line
         for line in lines
@@ -670,13 +765,11 @@ def get_calibration_status() -> list[dict[str, Any]]:
 
 def runtime_summary() -> dict[str, Any]:
     active_interface = get_active_interface()
-    current_network = get_network_info(active_interface) if active_interface else {}
     signal_config = get_signal_controller_config()
     signal_ping, signal_tcp = get_signal_checks(signal_config["host"], signal_config["port"])
     return {
         "hostname": get_hostname(),
         "active_interface": active_interface,
-        "current_network": current_network,
         "services": [service_status(name) for name in SERVICES],
         "signal_controller": {
             "host": signal_config["host"],
@@ -684,13 +777,18 @@ def runtime_summary() -> dict[str, Any]:
             "ping": signal_ping,
             "tcp": signal_tcp,
         },
+    }
+
+
+def data_summary(hours: float = 1.0) -> dict[str, Any]:
+    return {
         "metrics": {
             "flow": read_latest_csv_summary("flow"),
             "headway": read_latest_csv_summary("headway"),
             "queue": read_latest_csv_summary("queueLen"),
         },
+        "flow_window": read_flow_window_summary(hours),
         "recent_events": read_recent_log_events(),
-        "calibration": get_calibration_status(),
     }
 
 
@@ -867,6 +965,16 @@ def api_calibration_status():
 @app.get("/api/runtime-summary")
 def api_runtime_summary():
     return jsonify({"ok": True, "summary": runtime_summary()})
+
+
+@app.get("/api/data-summary")
+def api_data_summary():
+    raw_hours = request.args.get("hours", "1")
+    try:
+        hours = float(raw_hours)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "统计时长必须是数字"}), 400
+    return jsonify({"ok": True, "summary": data_summary(hours)})
 
 
 @app.get("/api/signal-controller")

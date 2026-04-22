@@ -18,7 +18,7 @@
           <span id="globalStatusDot" class="status-dot"></span>
           <span id="globalStatusText">检查中</span>
         </div>
-        <button id="refreshAllBtn" class="btn secondary">刷新全部</button>
+        <button id="refreshAllBtn" class="btn secondary">刷新当前页</button>
       </div>
     </header>
 
@@ -187,22 +187,35 @@
         <section class="page-panel" data-page-key="data-check" data-page-title="数据检测">
           <div class="section-head">
             <h2>数据检测</h2>
-            <p>用于查看识别程序最近输出的车流、车头时距、排队长度，以及近期异常提示。</p>
+            <p>点击刷新后查看各车道最新数据，并统计最近一段时间内的车流量。</p>
           </div>
-          <div class="card-grid three">
-            <article class="card">
-              <h3>最新车流</h3>
-              <div id="flowMetrics" class="metric-list"></div>
-            </article>
-            <article class="card">
-              <h3>最新车头时距</h3>
-              <div id="headwayMetrics" class="metric-list"></div>
-            </article>
-            <article class="card">
-              <h3>最新排队长度</h3>
-              <div id="queueMetrics" class="metric-list"></div>
-            </article>
-          </div>
+          <article class="card">
+            <div class="section-toolbar">
+              <div class="subtle">车道较多时，表格比卡片更容易横向对比。数据只在点击刷新时更新。</div>
+              <div class="actions">
+                <label class="inline-field">
+                  <span>统计最近</span>
+                  <input id="dataHoursInput" type="number" min="0.1" max="24" step="0.5" value="1">
+                  <span>小时</span>
+                </label>
+                <button id="refreshDataBtn" class="btn primary">刷新数据检测</button>
+              </div>
+            </div>
+          </article>
+          <article class="card">
+            <h3>最新车道数据</h3>
+            <div id="latestMetricMeta" class="subtle">尚未刷新。</div>
+            <div class="table-wrap">
+              <table id="latestMetricTable" class="data-table compact-table"></table>
+            </div>
+          </article>
+          <article class="card">
+            <h3>最近时段流量统计</h3>
+            <div id="hourlyFlowMeta" class="subtle">默认统计最近 1 小时，可修改后刷新。</div>
+            <div class="table-wrap">
+              <table id="hourlyFlowTable" class="data-table compact-table"></table>
+            </div>
+          </article>
           <article class="card">
             <h3>近期异常 / 提示</h3>
             <pre id="recentEvents" class="log-box">暂无异常日志</pre>
