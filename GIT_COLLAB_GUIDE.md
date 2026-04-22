@@ -1,6 +1,6 @@
 # Git 协作提交范围说明
 
-这份说明用于和前端同事协作开发 `Box_admin` 新页面。当前协作目标是：同事只补充页面和他自己程序的接口，不需要接触感知主程序、DeepStream、标注工具接收服务或现场配置。
+这份说明用于多人协作开发 `Box_admin` 新页面。当前协作目标是：页面开发人员只补充页面和各自程序所需接口，不需要接触感知主程序、DeepStream、标注工具接收服务或现场配置。
 
 ## 推荐 Git 仓库内容
 
@@ -48,9 +48,9 @@ release/
 
 原因：
 
-- `Traffic_detect/` 是路口感知检测主程序，不是前端同事当前工作范围。
+- `Traffic_detect/` 是路口感知检测主程序，不是页面开发人员当前工作范围。
 - `DeepStream-Yolo/` 可能包含 RTSP、模型、engine、推理配置和现场路径。
-- `Config_agent/` 是外部标定/配置工具接收服务，同事如果只做页面和自己的接口，不需要它。
+- `Config_agent/` 是外部标定/配置工具接收服务。如果只做页面和各自程序接口，不需要它。
 - `release/`、压缩包、离线包属于交付产物，不适合放源码仓库。
 
 也不要上传这些运行产物或敏感文件：
@@ -70,9 +70,9 @@ runtime.env
 *.tar.gz
 ```
 
-## 同事新增页面时主要改哪里
+## 新增页面时主要改哪里
 
-前端同事通常只需要改这三个文件：
+页面开发人员通常只需要改这三个文件：
 
 ```text
 Box_admin/templates/index.html
@@ -80,16 +80,16 @@ Box_admin/static/app.css
 Box_admin/static/app.js
 ```
 
-如果他需要给自己的程序做接口，可以在 `Box_admin/app.py` 里新增 `/api/...` 路由；接口只负责和他自己的程序通信，不要引用 `Traffic_detect` 或 `Config_agent` 的源码。
+如果需要给各自程序做接口，可以在 `Box_admin/app.py` 里新增 `/api/...` 路由；接口只负责和对应程序通信，不要引用 `Traffic_detect` 或 `Config_agent` 的源码。
 
 ## 新增页面约定
 
 在 `Box_admin/templates/index.html` 新增一个 `section.page-panel`：
 
 ```html
-<section class="page-panel" data-page-key="partner-page" data-page-title="同事功能页">
+<section class="page-panel" data-page-key="partner-page" data-page-title="协作功能页">
   <div class="section-head">
-    <h2>同事功能页</h2>
+    <h2>协作功能页</h2>
     <p>这里写给销售或现场人员看的说明。</p>
   </div>
 
@@ -107,7 +107,7 @@ Box_admin/static/app.js
 git checkout -b feature/partner-page
 ```
 
-同事开发完成后提交：
+开发完成后提交：
 
 ```bash
 git add Box_admin/templates/index.html Box_admin/static/app.css Box_admin/static/app.js Box_admin/app.py

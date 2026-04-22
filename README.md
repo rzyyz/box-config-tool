@@ -58,7 +58,7 @@ box_config_tool/
 └── README.md                          # 当前文件
 ```
 
-前端同事主要改：
+开发人员主要改：
 
 ```text
 Box_admin/templates/index.html
@@ -220,7 +220,7 @@ systemctl list-timers box_daily_reboot.timer
 bash scripts/disable_all_autostart.sh
 ```
 
-## 8. 提交给同事时建议包含
+## 8. 协作开发建议包含
 
 建议直接发送整个目录：
 
@@ -228,7 +228,7 @@ bash scripts/disable_all_autostart.sh
 Project/盒子内置配置工具/
 ```
 
-如果文件太大，前端同事最低需要：
+如果文件太大，页面开发人员最低需要：
 
 ```text
 Box_admin/
@@ -238,7 +238,7 @@ README.md
 NEW_BOARD_SAFE_GUIDE.md
 ```
 
-如果他需要联调真实数据、服务状态、相机和信号机配置，则必须保留：
+如果需要联调真实数据、服务状态、相机和信号机配置，则必须保留：
 
 ```text
 Traffic_detect/
@@ -247,7 +247,7 @@ DeepStream-Yolo/
 
 发送前注意不要外发现场真实 RTSP、账号、密码、内网 IP 等敏感信息。
 
-## 9. 前端同事开始工作前的检查清单
+## 9. 开发人员开始工作前的检查清单
 
 - 先读本文件和 `Box_admin/FRONTEND_COLLAB_GUIDE.md`。
 - 明确要新增的页面名称和 `data-page-key`。
