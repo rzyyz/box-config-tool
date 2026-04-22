@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>盒子内置配置工具</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-header">
+      <div>
+        <h1>边缘计算盒子运维管理工具</h1>
+        <p>用于现场快速完成盒子联网、相机绑定、标定检查和运行状态查看，减少手工输命令。</p>
+      </div>
+      <div class="header-right">
+        <div class="live-pill">
+          <span id="globalStatusDot" class="status-dot"></span>
+          <span id="globalStatusText">检查中</span>
+        </div>
+        <button id="refreshAllBtn" class="btn secondary">刷新全部</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar">
+        <div class="sidebar-title">功能分区</div>
+        <nav id="sidebarNav" class="nav-list"></nav>
+        <div class="sidebar-note">
+          左侧切换不同功能页面。销售只需要按顺序完成联网、绑定相机、检查运行状态即可。
+        </div>
+      </aside>
+
+      <main class="content">
+        <div id="toast" class="toast"></div>
+
+        <section class="page-panel active" data-page-key="network" data-page-title="联网设置">
+          <div class="section-head">
+            <h2>盒子联网设置</h2>
+            <p>选择网口后，会自动显示这个网口当前的 IP、网关和 DNS。可为每个网口填写备注，方便区分有线口和无线口。</p>
+          </div>
+          <div class="card-grid two">
+            <article class="card">
+              <h3>当前网络</h3>
+              <div id="networkSummary" class="summary-list"></div>
+            </article>
+            <article class="card">
+              <h3>应用配置</h3>
+              <div class="field-grid">
+                <label class="field">
+                  <span>网卡</span>
+                  <select id="iface"></select>
+                </label>
+                <label class="field">
+                  <span>网口备注</span>
+                  <input id="ifaceNote" placeholder="例如：无线联网口 / 左侧有线网口">
+                </label>
+                <label class="field">
+                  <span>IP 地址</span>
+                  <input id="ipAddress" placeholder="例如 172.16.16.243">
+                </label>
+                <label class="field">
+                  <span>子网掩码</span>
+                  <input id="netmask" placeholder="例如 255.255.255.0">
+                </label>
+                <label class="field">
+                  <span>网关</span>
+                  <input id="gateway" placeholder="例如 172.16.16.1">
+                </label>
+                <label class="field full">
+                  <span>DNS</span>
+                  <input id="dns" placeholder="多个地址用空格分隔">
+                </label>
+              </div>
+              <div class="actions">
+                <button id="applyNetworkBtn" class="btn primary">应用网络配置</button>
+              </div>
+            </article>
+          </div>
+        </section>
+
+        <section class="page-panel" data-page-key="camera" data-page-title="绑定相机">
+          <div class="section-head">
+            <h2>相机绑定与视频流配置</h2>
+            <p>填写相机名称、IP、账号和密码后，系统会自动生成 RTSP 地址。生成后仍然允许手工修改。</p>
+          </div>
+          <article class="card">
+            <div class="section-toolbar">
+              <div class="subtle">连通性检查会直接给出“正常 / 失败”的结果，方便现场快速判断相机是否能接入。</div>
+              <div class="actions">
+                <button id="reloadCameraBtn" class="btn secondary">刷新列表</button>
+                <button id="checkCameraBtn" class="btn secondary">检查连通性</button>
+                <button id="saveCameraBtn" class="btn primary">保存绑定</button>
+              </div>
+            </div>
+            <div class="table-wrap">
+              <table class="data-table">
+                <thead>
+                  <tr>
+                    <th>Source</th>
+                    <th>相机名称</th>
+                    <th>启用</th>
+                    <th>相机 IP</th>
+                    <th>账号</th>
+                    <th>密码</th>
+                    <th>路径</th>
+                    <th>RTSP URI</th>
+                    <th>状态</th>
+                  </tr>
+                </thead>
+                <tbody id="cameraTableBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
+        <section class="page-panel" data-page-key="calibration" data-page-title="画面标定">
+          <div class="section-head">
+            <h2>画面标定入口</h2>
+            <p>当前先用于确认标定文件是否齐全。真正的画线、画区仍然使用现有标定工具，后续会再接到这一页。</p>
+          </div>
+          <article class="card">
+            <div class="placeholder-box">
+              <div>
+                <h3>当前策略</h3>
+                <p>先用这个页面检查标定配置是否齐全，避免部署后因为缺文件导致程序无法正常识别。</p>
+              </div>
+            </div>
+            <div id="calibrationList" class="status-cards"></div>
+          </article>
+        </section>
+
+        <section class="page-panel" data-page-key="runtime" data-page-title="运行状态">
+          <div class="section-head">
+            <h2>运行状态</h2>
+            <p>用于查看程序是否已经正常启动，以及信号机心跳是否正常。详细数据和信号机配置已拆到单独页面。</p>
+          </div>
+          <article class="card">
+            <h3>服务快捷操作</h3>
+            <p class="subtle">可直接查看关键服务当前状态，并执行刷新、启动、重启、暂停操作。</p>
+            <div id="serviceQuickActions" class="status-cards"></div>
+          </article>
+          <div class="card-grid two">
+            <article class="card">
+              <h3>服务状态</h3>
+              <div id="serviceList" class="status-cards"></div>
+            </article>
+            <article class="card">
+              <h3>信号机心跳检测</h3>
+              <p class="subtle">显示当前保存的信号机 IP 和端口是否可达。需要修改参数时，请进入“信号机设置”页面。</p>
+              <div id="signalRuntimeStatus" class="summary-list"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="page-panel" data-page-key="signal" data-page-title="信号机设置">
+          <div class="section-head">
+            <h2>信号机设置</h2>
+            <p>配置路口信号机的 IP 和端口，并可立即检查 IP 是否能 Ping 通、端口是否能连接。</p>
+          </div>
+          <div class="card-grid two">
+            <article class="card">
+              <h3>目标地址</h3>
+              <p class="subtle">保存后会写入识别程序配置，并自动重启路口感知检测服务。</p>
+              <div class="field-grid">
+                <label class="field">
+                  <span>信号机 IP</span>
+                  <input id="signalHostInput" placeholder="例如 172.16.4.246">
+                </label>
+                <label class="field">
+                  <span>信号机端口</span>
+                  <input id="signalPortInput" placeholder="例如 40000">
+                </label>
+              </div>
+              <div class="actions">
+                <button id="checkSignalBtn" class="btn secondary">立即 Ping / 检查端口</button>
+                <button id="saveSignalBtn" class="btn primary">保存并自动重启</button>
+              </div>
+            </article>
+            <article class="card">
+              <h3>连通性结果</h3>
+              <div id="signalStatus" class="summary-list"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="page-panel" data-page-key="data-check" data-page-title="数据检测">
+          <div class="section-head">
+            <h2>数据检测</h2>
+            <p>用于查看识别程序最近输出的车流、车头时距、排队长度，以及近期异常提示。</p>
+          </div>
+          <div class="card-grid three">
+            <article class="card">
+              <h3>最新车流</h3>
+              <div id="flowMetrics" class="metric-list"></div>
+            </article>
+            <article class="card">
+              <h3>最新车头时距</h3>
+              <div id="headwayMetrics" class="metric-list"></div>
+            </article>
+            <article class="card">
+              <h3>最新排队长度</h3>
+              <div id="queueMetrics" class="metric-list"></div>
+            </article>
+          </div>
+          <article class="card">
+            <h3>近期异常 / 提示</h3>
+            <pre id="recentEvents" class="log-box">暂无异常日志</pre>
+          </article>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    window.BOX_ADMIN_BOOTSTRAP = {
+      signalHost: {{ signal_host|tojson }},
+      signalPort: {{ signal_port|tojson }},
+      services: {{ services|tojson }},
+    };
+  </script>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+*.egg-info/
+
+# Runtime logs and generated files
+*.log
+log/
+logs/
+output/
+outputs/
+queue_csv/
+runtime.env
+runtime_main.log
+gb43229.log
+*.jsonl
+
+# Local UI state generated on boxes
+Box_admin/config/
+
+# Deployment archives and release products
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+release/
+browser_offline_*/
+hezi_offline_deploy_*/
+
+# Heavy/sensitive runtime projects not needed for frontend-only collaboration
+Traffic_detect/
+DeepStream-Yolo/
+Config_agent/
+
+# DeepStream/model/runtime artifacts in case they appear elsewhere
+*.engine
+*.onnx
+*.pt
+*.pth
+*.weights
+output_kitti_data/
+generated/
+generated_runtime/
+runs/
+
+# Local documents that may contain customer/site information
+*.docx
+AI 前端.txt
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

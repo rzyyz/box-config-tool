@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Box Admin
+Name[zh_CN]=盒子配置工具
+Comment=打开盒子本地配置页面
+Comment[zh_CN]=打开盒子本地配置页面
+Exec=/bin/bash -lc 'if [ -x "$HOME/Project/box_config_tool/Box_admin/open_box_admin.sh" ]; then exec "$HOME/Project/box_config_tool/Box_admin/open_box_admin.sh"; elif [ -x "$HOME/Project/盒子内置配置工具/Box_admin/open_box_admin.sh" ]; then exec "$HOME/Project/盒子内置配置工具/Box_admin/open_box_admin.sh"; else exec "$HOME/Project/Box_admin/open_box_admin.sh"; fi'
+Path=/home/nvidia/Project/box_config_tool/Box_admin
+Icon=preferences-system-network
+Terminal=false
+Categories=Settings;Network;
+StartupNotify=true

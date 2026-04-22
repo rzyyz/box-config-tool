@@ -1,0 +1,18 @@
+[Unit]
+Description=智能感知系统配置工具服务 (manual start only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+WorkingDirectory=/home/nvidia/Project/box_config_tool/Box_admin
+Environment=BOX_ADMIN_HOST=0.0.0.0
+Environment=BOX_ADMIN_PORT=8090
+Environment=BOX_ADMIN_SERVICES=traffic_detect.service,config_agent.service,box_admin.service
+ExecStart=/bin/bash /home/nvidia/Project/box_config_tool/Box_admin/start.sh
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

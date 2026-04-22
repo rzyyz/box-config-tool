@@ -1,0 +1,11 @@
+[Unit]
+Description=Reboot edge box every day at 03:30
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+AccuracySec=1min
+Persistent=true
+Unit=box_daily_reboot.service
+
+[Install]
+WantedBy=timers.target

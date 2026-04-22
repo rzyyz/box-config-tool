@@ -1,0 +1,7 @@
+[Unit]
+Description=Daily reboot for edge box health protection
+Documentation=man:systemd.timer(5)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/reboot
