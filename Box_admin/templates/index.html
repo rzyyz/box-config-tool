@@ -137,16 +137,12 @@
         <section class="page-panel" data-page-key="runtime" data-page-title="运行状态">
           <div class="section-head">
             <h2>运行状态</h2>
-            <p>用于查看程序是否已经正常启动，并对关键服务执行刷新、启动、重启和暂停操作。</p>
+            <p>用于查看关键服务是否正常，并在需要时执行启动、重启、暂停和自启设置。</p>
           </div>
           <article class="card">
-            <h3>服务快捷操作</h3>
-            <p class="subtle">可直接查看关键服务当前状态，并执行刷新、启动、重启、暂停操作。</p>
+            <h3>服务状态与操作</h3>
+            <p class="subtle">每个服务只显示一次，状态、自启情况和常用操作都集中在这里。</p>
             <div id="serviceQuickActions" class="status-cards"></div>
-          </article>
-          <article class="card">
-            <h3>服务状态</h3>
-            <div id="serviceList" class="status-cards"></div>
           </article>
         </section>
 
@@ -185,19 +181,19 @@
         <section class="page-panel" data-page-key="step-control" data-page-title="步进控制状态">
           <div class="section-head">
             <h2>步进控制状态</h2>
-            <p>用于查看步进工具是否在线，并把信号机连接参数发送给步进工具。接口接入后，操作结果会显示在本页。</p>
+            <p>按现场操作顺序依次检查步进工具、发送信号机参数、查看控制状态，并完成配置文件同步上传。</p>
           </div>
-          <div class="card-grid two">
-            <article class="card">
-              <h3>步进工具连接</h3>
+          <div class="step-flow">
+            <article class="card step-card">
+              <div class="step-title"><span>1</span><h3>检查步进工具状态</h3></div>
               <p class="subtle">检查本机步进工具服务是否在线，便于确认后续参数发送和同步操作是否可用。</p>
               <div class="actions">
                 <button id="checkStepToolBtn" class="btn secondary">查询步进工具状态</button>
               </div>
               <div id="stepToolStatus" class="summary-list"></div>
             </article>
-            <article class="card">
-              <h3>信号机连接参数</h3>
+            <article class="card step-card">
+              <div class="step-title"><span>2</span><h3>信号机连接参数</h3></div>
               <p class="subtle">信号机 IP 会与“信号机设置”页面保持一致，任一页面修改后另一页同步更新。</p>
               <div class="field-grid">
                 <label class="field">
@@ -210,7 +206,7 @@
                 </label>
                 <label class="field">
                   <span>密码</span>
-                  <input id="stepPasswordInput" type="password" placeholder="请输入密码">
+                  <input id="stepPasswordInput" placeholder="请输入密码">
                 </label>
                 <label class="field">
                   <span>端口号</span>
@@ -218,24 +214,30 @@
                 </label>
               </div>
               <div class="actions">
+                <button id="fetchStepParamsBtn" class="btn secondary">读取当前参数</button>
                 <button id="sendStepParamsBtn" class="btn primary">发送参数</button>
               </div>
               <div id="stepParamStatus" class="summary-list"></div>
             </article>
-          </div>
-          <div class="card-grid two">
-            <article class="card">
-              <h3>信号机控制状态</h3>
+            <article class="card step-card">
+              <div class="step-title"><span>3</span><h3>信号机控制状态</h3></div>
               <p class="subtle">获取步进工具返回的信号机控制状态，便于现场确认当前控制链路。</p>
               <div class="actions">
                 <button id="fetchSignalControlStatusBtn" class="btn secondary">获取信号机控制状态</button>
               </div>
               <pre id="signalControlStatusOutput" class="log-box">尚未获取。</pre>
             </article>
-            <article class="card">
-              <h3>配置同步与上传</h3>
-              <p class="subtle">同步结果会显示是否成功；上传时请选择已下载的信号机配置文件，系统会发送给步进工具。</p>
+            <article class="card step-card">
+              <div class="step-title"><span>4</span><h3>配置同步上传</h3></div>
+              <p class="subtle">先打开当前信号机页面，由操作人员手动下载配置文件；上传时请选择下载好的配置文件，系统会发送给步进工具。</p>
+              <div class="summary-list">
+                <div class="summary-item">
+                  <span class="label">当前信号机 IP</span>
+                  <span id="stepDownloadSignalHost" class="value">-</span>
+                </div>
+              </div>
               <div class="actions">
+                <button id="openSignalConfigPageBtn" class="btn secondary">下载</button>
                 <button id="syncStepConfigBtn" class="btn secondary">同步</button>
                 <button id="uploadStepConfigBtn" class="btn primary">上传</button>
                 <input id="stepConfigFileInput" type="file" accept=".json,application/json" hidden>

@@ -205,9 +205,43 @@ html, body {
   grid-column: 1 / -1;
 }
 
+.step-flow {
+  display: grid;
+  gap: 18px;
+}
+
+.step-card {
+  border-left: 4px solid rgba(245, 158, 11, 0.72);
+}
+
+.step-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.step-title span {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+  background: rgba(245, 158, 11, 0.18);
+  border: 1px solid rgba(245, 158, 11, 0.38);
+  color: #fbbf24;
+  font-weight: 700;
+  flex: 0 0 auto;
+}
+
 .card h3 {
   margin: 0 0 14px;
   font-size: 18px;
+}
+
+.step-title h3 {
+  margin: 0;
 }
 
 .summary-list,

@@ -57,10 +57,14 @@ password: 按现场约定，不提交到 git
 - 联网设置：查看和配置网卡 IP、网关、DNS、网口备注。
 - 绑定相机：输入相机 IP、账号、密码、端口、路径，自动生成 RTSP，支持新增相机、禁用相机、高级彻底删除 source。
 - 相机检查分两类：IP Ping 只检查主机可达；视频流拉流使用 GStreamer `gst-launch-1.0 rtspsrc ... fakesink` 验证 RTSP 账号、密码、路径是否可用。
+- 绑定相机点击“检查连通性”后会立即显示“检查中”，禁用刷新/保存/检查按钮，避免用户误以为页面卡死。
 - 画面标定：当前先检查标定配置文件是否齐全。
-- 运行状态：显示服务状态、启停、重启、开机自启开关。
+- 运行状态：只保留“服务状态与操作”一个区块，集中显示服务状态、启停、重启、开机自启开关，避免重复状态栏。
 - 信号机设置：可配置信号机 IP 和端口，保存后自动重启路口感知检测服务；信号机心跳检测显示在本页。
-- 步进控制状态：检查本机步进工具 `http://127.0.0.1:8080` 是否在线，发送信号机连接参数，获取 `ctrlMode` 控制状态，上传信号机配置文件。
+- 步进控制状态：按 1 检查步进工具状态、2 信号机连接参数、3 信号机控制状态、4 配置同步上传的顺序展示。
+- 步进控制状态可读取当前步进工具参数：`GET http://127.0.0.1:8080/api/v1/tsc/config`，回填 IP、端口、账户、密码，密码在页面上按原文显示。
+- 步进工具 POST/上传接口需要 Spring Security CSRF；`Box_admin` 代理请求会先访问 `/login` 取得 `_csrf` 和 `JSESSIONID`，再带 `X-CSRF-TOKEN` 转发。
+- 配置同步上传里的“下载”按钮只新开 `http://<当前信号机IP>/`，由操作人员在信号机页面手动下载配置文件。
 - 数据检测：以表格展示全部车道数据，支持统计最近 N 小时流量，点击刷新才读取数据。
 
 近期性能优化：
@@ -160,6 +164,18 @@ bash scripts/install_daily_reboot_timer.sh
 - `scripts/install_daily_reboot_timer.sh` 安装每天 `03:30` 自动重启。
 - 如果排查黑屏、服务异常或内存问题，先检查 timer 是否真的启用。
 
+无线网自连：
+
+- 内网交付盒子如同时连接信控有线网和无线网，可能造成网络边界风险。
+- 如现场希望无线网只手动连接，使用：
+
+```bash
+nmcli -t -f NAME,TYPE,AUTOCONNECT,DEVICE connection show
+sudo nmcli connection modify '<wifi-connection-name>' connection.autoconnect no
+```
+
+- 该操作不会立即断开当前 Wi-Fi，但重启后不会自动连接该无线配置。
+
 常用命令：
 
 ```bash
@@ -244,6 +260,7 @@ https://github.com/rzyyz/box-config-tool.git
 git status --short
 git diff --stat
 python -m py_compile Box_admin/app.py
+node --check Box_admin/static/app.js
 ```
 
 ## 远程盒子验证
@@ -254,6 +271,7 @@ python -m py_compile Box_admin/app.py
 curl http://127.0.0.1:8090/api/status
 curl http://127.0.0.1:8090/api/runtime-summary
 curl "http://127.0.0.1:8090/api/data-summary?hours=1"
+curl http://127.0.0.1:8090/api/step-tool/tsc-config
 ```
 
 资源排查：

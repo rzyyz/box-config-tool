@@ -1,5 +1,6 @@
 import configparser
 import csv
+import http.cookiejar
 import ipaddress
 import json
 import os
@@ -59,6 +60,7 @@ DEFAULT_SIGNAL_CONTROLLER_HOST = os.getenv("BOX_ADMIN_DEFAULT_SIGNAL_HOST", "172
 DEFAULT_SIGNAL_CONTROLLER_PORT = int(os.getenv("BOX_ADMIN_DEFAULT_SIGNAL_PORT", "40000"))
 STEP_TOOL_BASE_URL = os.getenv("BOX_ADMIN_STEP_TOOL_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
 STEP_TOOL_TIMEOUT = float(os.getenv("BOX_ADMIN_STEP_TOOL_TIMEOUT", "5"))
+STEP_TOOL_CSRF_PATH = os.getenv("BOX_ADMIN_STEP_TOOL_CSRF_PATH", "/login")
 CTRL_MODE_LABELS = {
     0: "本地时段控制",
     1: "关灯控制",
@@ -716,21 +718,26 @@ def get_signal_checks(host: str, port: int, force: bool = False) -> tuple[dict[s
     return ping_result, tcp_result
 
 
-def step_tool_request(path: str, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
-    url = f"{STEP_TOOL_BASE_URL}{path}"
-    headers = {"Accept": "application/json"}
-    data = None
-    if payload is not None:
-        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urlrequest.Request(url, data=data, headers=headers, method=method)
+def step_tool_csrf_opener() -> tuple[urlrequest.OpenerDirector, str]:
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urlrequest.build_opener(urlrequest.HTTPCookieProcessor(cookie_jar))
+    login_url = f"{STEP_TOOL_BASE_URL}{STEP_TOOL_CSRF_PATH}"
     try:
-        with urlrequest.urlopen(req, timeout=STEP_TOOL_TIMEOUT) as response:
-            raw = response.read().decode("utf-8")
-    except urlerror.URLError as exc:
-        raise RuntimeError(f"无法连接步进工具服务：{exc}") from exc
-    except TimeoutError as exc:
-        raise RuntimeError("连接步进工具服务超时") from exc
+        with opener.open(login_url, timeout=STEP_TOOL_TIMEOUT) as response:
+            html = response.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        raise RuntimeError(f"无法获取步进工具安全令牌：{exc}") from exc
+    match = re.search(r'name=["\']_csrf["\'][^>]*value=["\']([^"\']+)["\']', html)
+    if not match:
+        match = re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']_csrf["\']', html)
+    if not match:
+        raise RuntimeError("步进工具未返回安全令牌，请确认服务登录页是否正常")
+    return opener, match.group(1)
+
+
+def step_tool_decode_json(raw: str, final_url: str) -> dict[str, Any]:
+    if final_url.rstrip("/").endswith("/login"):
+        raise RuntimeError("步进工具要求安全令牌或登录态，当前请求被重定向到登录页")
     try:
         result = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -740,8 +747,32 @@ def step_tool_request(path: str, method: str = "GET", payload: dict[str, Any] | 
     return result
 
 
+def step_tool_request(path: str, method: str = "GET", payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    url = f"{STEP_TOOL_BASE_URL}{path}"
+    headers = {"Accept": "application/json"}
+    data = None
+    opener = urlrequest.build_opener()
+    if method.upper() not in ("GET", "HEAD"):
+        opener, csrf_token = step_tool_csrf_opener()
+        headers["X-CSRF-TOKEN"] = csrf_token
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urlrequest.Request(url, data=data, headers=headers, method=method)
+    try:
+        with opener.open(req, timeout=STEP_TOOL_TIMEOUT) as response:
+            raw = response.read().decode("utf-8")
+            final_url = response.geturl()
+    except urlerror.URLError as exc:
+        raise RuntimeError(f"无法连接步进工具服务：{exc}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("连接步进工具服务超时") from exc
+    return step_tool_decode_json(raw, final_url)
+
+
 def step_tool_upload(path: str, filename: str, content: bytes, mimetype: str) -> dict[str, Any]:
     url = f"{STEP_TOOL_BASE_URL}{path}"
+    opener, csrf_token = step_tool_csrf_opener()
     boundary = f"----box-config-tool-{uuid.uuid4().hex}"
     safe_filename = Path(filename or "config.json").name.replace('"', "")
     content_type = mimetype or "application/octet-stream"
@@ -762,23 +793,19 @@ def step_tool_upload(path: str, filename: str, content: bytes, mimetype: str) ->
             "Accept": "application/json",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "Content-Length": str(len(body)),
+            "X-CSRF-TOKEN": csrf_token,
         },
         method="POST",
     )
     try:
-        with urlrequest.urlopen(req, timeout=STEP_TOOL_TIMEOUT) as response:
+        with opener.open(req, timeout=STEP_TOOL_TIMEOUT) as response:
             raw = response.read().decode("utf-8")
+            final_url = response.geturl()
     except urlerror.URLError as exc:
         raise RuntimeError(f"无法连接步进工具服务：{exc}") from exc
     except TimeoutError as exc:
         raise RuntimeError("连接步进工具服务超时") from exc
-    try:
-        result = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("步进工具返回内容不是有效 JSON") from exc
-    if result.get("code") != 200:
-        raise RuntimeError(str(result.get("message") or "步进工具上传接口返回失败"))
-    return result
+    return step_tool_decode_json(raw, final_url)
 
 
 def load_camera_aliases() -> dict[str, str]:
@@ -1507,15 +1534,37 @@ def api_step_tool_tsc_config():
         )
     except RuntimeError as exc:
         return jsonify({"ok": False, "message": str(exc)}), 502
-    success = result.get("data") is True
+    success = result.get("data") is not False
     return jsonify(
         {
             "ok": success,
-            "message": "参数发送成功" if success else "参数发送失败",
+            "message": str(result.get("message") or ("参数发送成功" if success else "参数发送失败")),
             "success": success,
             "raw": result,
         }
     ), 200 if success else 502
+
+
+@app.get("/api/step-tool/tsc-config")
+def api_step_tool_tsc_config_get():
+    try:
+        result = step_tool_request("/api/v1/tsc/config")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 502
+    data = result.get("data") or {}
+    return jsonify(
+        {
+            "ok": True,
+            "message": str(result.get("message") or "当前参数读取成功"),
+            "config": {
+                "ip": data.get("ip") or "",
+                "port": data.get("port") or "",
+                "username": data.get("username") or "",
+                "password": data.get("password") or "",
+            },
+            "raw": result,
+        }
+    )
 
 
 @app.get("/api/step-tool/tsc-status")

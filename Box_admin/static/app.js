@@ -299,19 +299,6 @@ function renderCalibration(items) {
 }
 
 
-function renderServiceStatus(services) {
-  const root = document.getElementById("serviceList");
-  setHtmlIfChanged(root, services.map((item) => `
-    <div class="status-card">
-      <span class="label">${item.display_name || item.name}</span>
-      <div class="value">${statusBadge(item.status, item.status_label || item.status)}</div>
-      <div class="value" style="margin-top:8px;">重启后自动启动：${statusBadge(item.autostart_enabled ? "ok" : "inactive", item.autostart_label || "未知")}</div>
-      <div class="value" style="margin-top:8px; color: var(--muted); font-size: 13px;">系统服务：${item.name}</div>
-    </div>
-  `).join(""));
-}
-
-
 function renderServiceQuickActions(services) {
   const root = document.getElementById("serviceQuickActions");
   const html = services.map((item) => {
@@ -388,6 +375,17 @@ function syncSignalHostInputs(value, sourceId) {
     }
     input.value = value;
   });
+  updateStepDownloadSignalHost(value);
+}
+
+
+function updateStepDownloadSignalHost(value) {
+  const root = document.getElementById("stepDownloadSignalHost");
+  if (!root) {
+    return;
+  }
+  const host = (value || document.getElementById("stepSignalHostInput")?.value || document.getElementById("signalHostInput")?.value || "").trim();
+  root.textContent = host || "-";
 }
 
 
@@ -419,6 +417,7 @@ function renderStepControlPage() {
   if (stepPortInput && !stepPortInput.value) {
     stepPortInput.value = "80";
   }
+  updateStepDownloadSignalHost(stepHostInput?.value || signalHost);
   renderStepStatus("stepToolStatus", "inactive", "步进工具", "尚未查询");
   renderStepStatus("stepParamStatus", "inactive", "参数发送", "等待发送");
   renderStepStatus("stepSyncStatus", "inactive", "同步 / 上传", "尚未操作");
@@ -590,7 +589,6 @@ async function loadCalibrationStatus() {
 async function loadRuntimeSummary() {
   const data = await fetchJson("/api/runtime-summary");
   const summary = data.summary || {};
-  renderServiceStatus(summary.services || []);
   renderServiceQuickActions(summary.services || []);
   const signal = summary.signal_controller || { host: "-", port: "-", ping: {}, tcp: {} };
   renderSignalStatus(signal, "signalStatus", true);
@@ -703,6 +701,28 @@ function wireActions() {
 
   document.getElementById("checkCameraBtn").addEventListener("click", async () => {
     clearToast();
+    const checkButton = document.getElementById("checkCameraBtn");
+    const saveButton = document.getElementById("saveCameraBtn");
+    const reloadButton = document.getElementById("reloadCameraBtn");
+    const previousText = checkButton.textContent;
+    const rows = Array.from(document.querySelectorAll("#cameraTableBody tr"));
+    checkButton.disabled = true;
+    saveButton.disabled = true;
+    reloadButton.disabled = true;
+    checkButton.textContent = "检查中...";
+    rows.forEach((row) => {
+      const enabled = row.querySelector('[data-field="enable"]').value === "1";
+      const pingCell = row.querySelector('[data-check="ping"]');
+      const streamCell = row.querySelector('[data-check="stream"]');
+      if (!enabled) {
+        pingCell.innerHTML = '<span class="badge warn">已禁用</span>';
+        streamCell.innerHTML = '<span class="badge warn">已禁用</span>';
+        return;
+      }
+      pingCell.innerHTML = '<span class="badge warn">检查中</span><div style="margin-top:6px;color:var(--muted);font-size:12px;">正在 Ping 相机 IP...</div>';
+      streamCell.innerHTML = '<span class="badge warn">检查中</span><div style="margin-top:6px;color:var(--muted);font-size:12px;">正在验证视频流，可能需要十几秒...</div>';
+    });
+    showToast("正在检查相机连通性，请稍候...", true);
     try {
       const data = await fetchJson("/api/camera-bindings/check", {
         method: "POST",
@@ -732,6 +752,11 @@ function wireActions() {
       showToast(hasFailure ? "检查完成：有相机 Ping 或视频流拉流失败，请看表格红色结果。" : "检查完成：所有启用相机 Ping 和视频流拉流正常。", !hasFailure);
     } catch (error) {
       showToast(error.message, false);
+    } finally {
+      checkButton.disabled = false;
+      saveButton.disabled = false;
+      reloadButton.disabled = false;
+      checkButton.textContent = previousText;
     }
   });
 
@@ -760,7 +785,10 @@ function wireActions() {
     if (!input) {
       return;
     }
-    input.addEventListener("input", () => syncSignalHostInputs(input.value.trim(), id));
+    input.addEventListener("input", () => {
+      syncSignalHostInputs(input.value.trim(), id);
+      updateStepDownloadSignalHost(input.value.trim());
+    });
   });
 
   document.getElementById("checkSignalBtn").addEventListener("click", async () => {
@@ -791,6 +819,25 @@ function wireActions() {
       showToast(data.message, data.online);
     } catch (error) {
       renderStepStatus("stepToolStatus", "failed", "步进工具", error.message);
+      showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("fetchStepParamsBtn").addEventListener("click", async () => {
+    clearToast();
+    try {
+      const data = await fetchJson("/api/step-tool/tsc-config");
+      const config = data.config || {};
+      document.getElementById("stepSignalHostInput").value = config.ip || "";
+      document.getElementById("stepUsernameInput").value = config.username || "";
+      document.getElementById("stepPasswordInput").value = config.password || "";
+      document.getElementById("stepPortInput").value = config.port || "";
+      syncSignalHostInputs(config.ip || "", "stepSignalHostInput");
+      updateStepDownloadSignalHost(config.ip || "");
+      renderStepStatus("stepParamStatus", "ok", "参数读取", data.message || "当前参数读取成功");
+      showToast(data.message || "当前参数读取成功", true);
+    } catch (error) {
+      renderStepStatus("stepParamStatus", "failed", "参数读取", error.message);
       showToast(error.message, false);
     }
   });
@@ -835,6 +882,21 @@ function wireActions() {
   document.getElementById("syncStepConfigBtn").addEventListener("click", () => {
     clearToast();
     showStepPending("stepSyncStatus", "配置同步");
+  });
+
+  document.getElementById("openSignalConfigPageBtn").addEventListener("click", () => {
+    clearToast();
+    const host = document.getElementById("stepSignalHostInput").value.trim() || document.getElementById("signalHostInput").value.trim();
+    if (!host) {
+      renderStepStatus("stepSyncStatus", "failed", "配置下载", "请先填写或读取信号机 IP");
+      showToast("请先填写或读取信号机 IP", false);
+      return;
+    }
+    const url = /^https?:\/\//i.test(host) ? host : `http://${host}/`;
+    window.open(url, "_blank", "noopener,noreferrer");
+    updateStepDownloadSignalHost(host);
+    renderStepStatus("stepSyncStatus", "ok", "配置下载", `已打开 ${url}`);
+    showToast("已打开信号机页面，请在新页面手动下载配置文件。", true);
   });
 
   document.getElementById("uploadStepConfigBtn").addEventListener("click", () => {
