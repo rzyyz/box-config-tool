@@ -18,7 +18,7 @@
           <span id="globalStatusDot" class="status-dot"></span>
           <span id="globalStatusText">检查中</span>
         </div>
-        <button id="refreshAllBtn" class="btn secondary">刷新全部</button>
+        <button id="refreshAllBtn" class="btn secondary">刷新当前页</button>
       </div>
     </header>
 
@@ -86,9 +86,10 @@
           </div>
           <article class="card">
             <div class="section-toolbar">
-              <div class="subtle">连通性检查会直接给出“正常 / 失败”的结果，方便现场快速判断相机是否能接入。</div>
+              <div class="subtle">检查分为 IP Ping 和视频流拉流。Ping 只说明相机地址可达，拉流会验证账号、密码和 RTSP 地址是否可用。</div>
               <div class="actions">
                 <button id="reloadCameraBtn" class="btn secondary">刷新列表</button>
+                <button id="addCameraBtn" class="btn secondary">新增相机</button>
                 <button id="checkCameraBtn" class="btn secondary">检查连通性</button>
                 <button id="saveCameraBtn" class="btn primary">保存绑定</button>
               </div>
@@ -103,9 +104,12 @@
                     <th>相机 IP</th>
                     <th>账号</th>
                     <th>密码</th>
+                    <th>端口</th>
                     <th>路径</th>
                     <th>RTSP URI</th>
-                    <th>状态</th>
+                    <th>IP Ping</th>
+                    <th>视频流拉流</th>
+                    <th>操作</th>
                   </tr>
                 </thead>
                 <tbody id="cameraTableBody"></tbody>
@@ -133,34 +137,23 @@
         <section class="page-panel" data-page-key="runtime" data-page-title="运行状态">
           <div class="section-head">
             <h2>运行状态</h2>
-            <p>用于查看程序是否已经正常启动，以及信号机心跳是否正常。详细数据和信号机配置已拆到单独页面。</p>
+            <p>用于查看关键服务是否正常，并在需要时执行启动、重启、暂停和自启设置。</p>
           </div>
           <article class="card">
-            <h3>服务快捷操作</h3>
-            <p class="subtle">可直接查看关键服务当前状态，并执行刷新、启动、重启、暂停操作。</p>
+            <h3>服务状态与操作</h3>
+            <p class="subtle">每个服务只显示一次，状态、自启情况和常用操作都集中在这里。</p>
             <div id="serviceQuickActions" class="status-cards"></div>
           </article>
-          <div class="card-grid two">
-            <article class="card">
-              <h3>服务状态</h3>
-              <div id="serviceList" class="status-cards"></div>
-            </article>
-            <article class="card">
-              <h3>信号机心跳检测</h3>
-              <p class="subtle">显示当前保存的信号机 IP 和端口是否可达。需要修改参数时，请进入“信号机设置”页面。</p>
-              <div id="signalRuntimeStatus" class="summary-list"></div>
-            </article>
-          </div>
         </section>
 
-        <section class="page-panel" data-page-key="signal" data-page-title="信号机设置">
+        <section class="page-panel" data-page-key="step-control" data-page-title="信号机与智能控制平台连通状态">
           <div class="section-head">
-            <h2>信号机设置</h2>
-            <p>配置路口信号机的 IP 和端口，并可立即检查 IP 是否能 Ping 通、端口是否能连接。</p>
+            <h2>信号机与智能控制平台连通状态</h2>
+            <p>先确认信号机地址，再按现场操作顺序检查智能控制平台、发送参数、查看控制状态、完成配置文件同步上传。</p>
           </div>
           <div class="card-grid two">
             <article class="card">
-              <h3>目标地址</h3>
+              <div class="step-title"><span>1</span><h3>信号机与智能控制平台参数</h3></div>
               <p class="subtle">保存后会写入识别程序配置，并自动重启路口感知检测服务。</p>
               <div class="field-grid">
                 <label class="field">
@@ -174,35 +167,119 @@
               </div>
               <div class="actions">
                 <button id="checkSignalBtn" class="btn secondary">立即 Ping / 检查端口</button>
-                <button id="saveSignalBtn" class="btn primary">保存并自动重启</button>
+                <button id="saveSignalBtn" class="btn primary">保存配置并将IP同步到车辆检测服务</button>
               </div>
+                <div class="field-grid smart-platform-fields">
+                  <label class="field">
+                    <span>信号机控制端口</span>
+                    <input id="stepPortInput" placeholder="例如 29999">
+                  </label>
+                  <label class="field">
+                    <span>信号机控制账户</span>
+                    <input id="stepUsernameInput" placeholder="例如 admin">
+                  </label>
+                  <label class="field">
+                    <span>信号机控制密码</span>
+                    <input id="stepPasswordInput" placeholder="请输入密码">
+                  </label>
+                </div>
+                <div class="actions">
+                <button id="sendStepParamsBtn" class="btn primary">登录测试并同步参数到智能控制平台</button>
+                </div>
+              <div id="stepParamStatus" class="summary-list"></div>
             </article>
             <article class="card">
-              <h3>连通性结果</h3>
+              <h3>信号机心跳检测</h3>
+              <p class="subtle">显示当前保存的信号机 IP 和端口是否可达。修改参数后可立即检查，也可保存后让路口感知检测服务生效。</p>
               <div id="signalStatus" class="summary-list"></div>
             </article>
+          </div>
+          <div class="step-flow">
+            <article class="card step-card">
+              <div class="step-title"><span>2</span><h3>检查智能控制程序状态</h3></div>
+              <p class="subtle">检查本机智能控制程序是否在线，便于确认后续参数发送和同步操作是否可用。</p>
+              <div class="actions">
+                <button id="checkStepToolBtn" class="btn secondary">查询智能控制状态</button>
+                <button id="restartPreplanServiceBtn" class="btn secondary danger">重启智能控制服务</button>
+              </div>
+              <div id="stepToolStatus" class="summary-list"></div>
+            </article>
+            <div class="step-compact-grid">
+            <article class="card step-card compact">
+              <div class="step-title"><span>3</span><h3>信号机当前控制状态</h3></div>
+              <p class="subtle">获取智能控制返回的信号机当前控制状态，便于现场确认当前控制链路。</p>
+              <div class="actions">
+                <button id="fetchSignalControlStatusBtn" class="btn secondary">获取当前控制状态</button>
+              </div>
+              <pre id="signalControlStatusOutput" class="log-box">尚未获取。</pre>
+            </article>
+            <article class="card step-card compact">
+              <div class="step-title"><span>4</span><h3>配置同步上传</h3></div>
+              <p class="subtle">先打开当前信号机页面，由操作人员手动下载配置文件；上传时请选择下载好的配置文件，系统会发送给智能控制。</p>
+              <div class="summary-list">
+                <div class="summary-item">
+                  <span class="label">当前信号机 IP</span>
+                  <span id="stepDownloadSignalHost" class="value">-</span>
+                </div>
+              </div>
+              <div class="actions">
+                <button id="openSignalConfigPageBtn" class="btn secondary">下载</button>
+                <button id="syncStepConfigBtn" class="btn secondary">同步</button>
+                <button id="uploadStepConfigBtn" class="btn primary">上传</button>
+                <input id="stepConfigFileInput" type="file" accept=".json,application/json" hidden>
+              </div>
+              <div id="stepSyncStatus" class="summary-list"></div>
+            </article>
+            <article class="card step-card compact">
+              <div class="step-title"><span>5</span><h3>步进控制服务</h3></div>
+              <p class="subtle">选择步进控制时长后，可测试是否能进入步进控制，也可取消步进控制。</p>
+              <label class="field">
+                <span>步进控制时长（秒）</span>
+                <input id="stepDurationInput" type="number" min="1" step="1" value="30">
+              </label>
+              <div class="actions">
+                <button id="testStepControlBtn" class="btn secondary">测试步进控制</button>
+                <button id="cancelStepControlBtn" class="btn secondary">取消步进控制</button>
+                <button id="openStepToolPageBtn" class="btn primary">打开智能控制页面</button>
+              </div>
+              <div id="stepServiceStatus" class="summary-list"></div>
+            </article>
+            </div>
           </div>
         </section>
 
         <section class="page-panel" data-page-key="data-check" data-page-title="数据检测">
           <div class="section-head">
             <h2>数据检测</h2>
-            <p>用于查看识别程序最近输出的车流、车头时距、排队长度，以及近期异常提示。</p>
+            <p>点击刷新后查看各车道最新数据，并统计最近一段时间内的车流量。</p>
           </div>
-          <div class="card-grid three">
-            <article class="card">
-              <h3>最新车流</h3>
-              <div id="flowMetrics" class="metric-list"></div>
-            </article>
-            <article class="card">
-              <h3>最新车头时距</h3>
-              <div id="headwayMetrics" class="metric-list"></div>
-            </article>
-            <article class="card">
-              <h3>最新排队长度</h3>
-              <div id="queueMetrics" class="metric-list"></div>
-            </article>
-          </div>
+          <article class="card">
+            <div class="section-toolbar">
+              <div class="subtle">车道较多时，表格比卡片更容易横向对比。数据只在点击刷新时更新。</div>
+              <div class="actions">
+                <label class="inline-field">
+                  <span>统计最近</span>
+                  <input id="dataMinutesInput" type="number" min="1" max="1440" step="1" value="60">
+                  <span>分钟</span>
+                </label>
+                <button id="refreshDataBtn" class="btn primary">刷新数据检测</button>
+              </div>
+            </div>
+          </article>
+          <article class="card">
+            <h3>最近三分钟车道数据</h3>
+            <div id="latestMetricMeta" class="subtle">尚未刷新。</div>
+            <div class="table-wrap">
+              <table id="latestMetricTable" class="data-table compact-table"></table>
+            </div>
+          </article>
+          <article class="card">
+            <h3>最近时段流量统计</h3>
+            <div id="hourlyFlowMeta" class="subtle">默认统计最近 60 分钟，可修改后刷新。</div>
+            <div class="table-wrap">
+              <table id="hourlyFlowTable" class="data-table compact-table"></table>
+            </div>
+          </article>
           <article class="card">
             <h3>近期异常 / 提示</h3>
             <pre id="recentEvents" class="log-box">暂无异常日志</pre>

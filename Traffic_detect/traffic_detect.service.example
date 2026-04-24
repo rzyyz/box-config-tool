@@ -1,0 +1,21 @@
+[Unit]
+Description=路口感知检测服务 (manual start only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+WorkingDirectory=/home/nvidia/Project/box_config_tool/Traffic_detect
+Environment=HOME=/home/nvidia
+Environment=BOX_CONFIG_LOG_ROOT=/home/nvidia/Project/box_config_tool/logs
+ExecStart=/bin/bash /home/nvidia/Project/box_config_tool/Traffic_detect/start.sh
+Restart=on-failure
+RestartSec=5
+
+# Safety note:
+# The installer disables autostart by default. Enable this service only after
+# camera RTSP, network routes, and signal controller settings are verified.
+
+[Install]
+WantedBy=multi-user.target

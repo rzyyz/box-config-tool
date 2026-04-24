@@ -1,0 +1,23 @@
+[Unit]
+Description=检测线数据接收服务 (manual start only)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvidia
+WorkingDirectory=/home/nvidia/Project/box_config_tool/Config_agent
+Environment=CONFIG_AGENT_HOST=0.0.0.0
+Environment=CONFIG_AGENT_PORT=18080
+Environment=DETECTOR_SERVICE_NAME=traffic_detect.service
+Environment=BOX_CONFIG_LOG_ROOT=/home/nvidia/Project/box_config_tool/logs
+ExecStart=/bin/bash /home/nvidia/Project/box_config_tool/Config_agent/start.sh
+Restart=on-failure
+RestartSec=2
+
+# Safety note:
+# The installer disables autostart by default. Enable it only after field
+# configuration has been verified.
+
+[Install]
+WantedBy=multi-user.target

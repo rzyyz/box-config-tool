@@ -10,6 +10,7 @@ WorkingDirectory=/home/nvidia/Project/box_config_tool/Box_admin
 Environment=BOX_ADMIN_HOST=0.0.0.0
 Environment=BOX_ADMIN_PORT=8090
 Environment=BOX_ADMIN_SERVICES=traffic_detect.service,config_agent.service,box_admin.service
+Environment=BOX_CONFIG_LOG_ROOT=/home/nvidia/Project/box_config_tool/logs
 ExecStart=/bin/bash /home/nvidia/Project/box_config_tool/Box_admin/start.sh
 Restart=on-failure
 RestartSec=2

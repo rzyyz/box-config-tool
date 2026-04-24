@@ -1,17 +1,23 @@
 import configparser
 import csv
+import http.cookiejar
 import ipaddress
 import json
 import os
 import re
+import shutil
 import shlex
 import socket
 import subprocess
 import time
+import uuid
+from io import StringIO
 from collections import deque
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, unquote, urlparse, urlunparse
+from urllib import error as urlerror
+from urllib import request as urlrequest
+from urllib.parse import quote, unquote, urlencode, urlparse, urlunparse
 
 from flask import Flask, jsonify, render_template, request
 
@@ -52,6 +58,31 @@ NETWORK_INTERFACE = os.getenv("BOX_ADMIN_INTERFACE", "")
 LOG_PATH = Path(os.getenv("BOX_ADMIN_LOG_PATH", "/tmp/box_admin.log"))
 DEFAULT_SIGNAL_CONTROLLER_HOST = os.getenv("BOX_ADMIN_DEFAULT_SIGNAL_HOST", "172.16.4.246")
 DEFAULT_SIGNAL_CONTROLLER_PORT = int(os.getenv("BOX_ADMIN_DEFAULT_SIGNAL_PORT", "40000"))
+STEP_TOOL_BASE_URL = os.getenv("BOX_ADMIN_STEP_TOOL_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
+STEP_TOOL_TIMEOUT = float(os.getenv("BOX_ADMIN_STEP_TOOL_TIMEOUT", "5"))
+STEP_TOOL_CSRF_PATH = os.getenv("BOX_ADMIN_STEP_TOOL_CSRF_PATH", "/login")
+STEP_TOOL_LOGIN_USERNAME = os.getenv("BOX_ADMIN_STEP_TOOL_LOGIN_USERNAME", "admin")
+STEP_TOOL_LOGIN_PASSWORD = os.getenv("BOX_ADMIN_STEP_TOOL_LOGIN_PASSWORD", "admin123")
+CTRL_MODE_LABELS = {
+    0: "本地时段控制",
+    1: "关灯控制",
+    2: "黄闪控制",
+    3: "全红控制",
+    4: "定周期控制",
+    5: "协调绿波控制",
+    6: "协议红波控制",
+    7: "全感应控制",
+    8: "半感应控制",
+    9: "协调绿波全感应控制",
+    10: "步进控制",
+    12: "行人过街控制",
+    13: "单点自适应控制",
+    14: "静态干线控制",
+    15: "动态干线控制",
+    16: "区域优化控制",
+    17: "单点优化控制",
+    18: "公交优先控制",
+}
 
 
 def _parse_services() -> list[str]:
@@ -371,16 +402,81 @@ def parse_deepstream_sources(path: Path) -> list[dict[str, Any]]:
     return sources
 
 
+def find_deepstream_source_blocks(lines: list[str]) -> list[tuple[int, int, int]]:
+    blocks = []
+    index = 0
+    section_pattern = re.compile(r"\[[^\]]+\]\s*$")
+    source_pattern = re.compile(r"\[source(\d+)\]\s*$")
+    while index < len(lines):
+        match = source_pattern.match(lines[index].strip())
+        if not match:
+            index += 1
+            continue
+        source_index = int(match.group(1))
+        start = index
+        index += 1
+        while index < len(lines) and not section_pattern.match(lines[index].strip()):
+            index += 1
+        blocks.append((source_index, start, index))
+    return blocks
+
+
+def set_source_block_value(block: list[str], key: str, value: str) -> list[str]:
+    key_prefix = f"{key}="
+    output = []
+    replaced = False
+    for line in block:
+        if not replaced and line.strip().startswith(key_prefix):
+            output.append(f"{key}={value}")
+            replaced = True
+        else:
+            output.append(line)
+    if replaced:
+        return output
+    insert_at = len(output)
+    while insert_at > 1 and output[insert_at - 1].strip() == "":
+        insert_at -= 1
+    output.insert(insert_at, f"{key}={value}")
+    return output
+
+
+def build_deepstream_source_block(template: list[str], index: int, update: dict[str, Any]) -> list[str]:
+    if template:
+        block = list(template)
+        block[0] = f"[source{index}]"
+    else:
+        block = [
+            f"[source{index}]",
+            "enable=1",
+            "type=2",
+            "uri=",
+            "num-sources=1",
+            "gpu-id=0",
+            "cudadec-memtype=2",
+            "",
+        ]
+    block = set_source_block_value(block, "enable", "1" if update["enable"] else "0")
+    block = set_source_block_value(block, "uri", str(update["uri"]))
+    if block and block[-1].strip():
+        block.append("")
+    return block
+
+
 def update_deepstream_sources(path: Path, updates: list[dict[str, Any]]) -> None:
     text = path.read_text(encoding="utf-8")
     lines = text.splitlines()
     by_index = {int(item["index"]): item for item in updates}
+    blocks = find_deepstream_source_blocks(lines)
+    existing_indices = {index for index, _start, _end in blocks}
     current_section = None
     output = []
+    section_pattern = re.compile(r"\[([^\]]+)\]\s*$")
+    source_pattern = re.compile(r"source(\d+)$")
     for line in lines:
-        section_match = re.match(r"\[(source(\d+))\]\s*$", line.strip())
+        section_match = section_pattern.match(line.strip())
         if section_match:
-            current_section = int(section_match.group(2))
+            source_match = source_pattern.fullmatch(section_match.group(1))
+            current_section = int(source_match.group(1)) if source_match else None
             output.append(line)
             continue
         if current_section in by_index:
@@ -393,7 +489,38 @@ def update_deepstream_sources(path: Path, updates: list[dict[str, Any]]) -> None
                 output.append(f"uri={update['uri']}")
                 continue
         output.append(line)
+    new_indices = sorted(index for index in by_index if index not in existing_indices)
+    if new_indices:
+        updated_blocks = find_deepstream_source_blocks(output)
+        if updated_blocks:
+            _template_index, template_start, template_end = updated_blocks[-1]
+            template = output[template_start:template_end]
+            insert_at = template_end
+        else:
+            template = []
+            insert_at = len(output)
+        new_lines = []
+        for index in new_indices:
+            if index < 0:
+                raise ValueError("source id 不能为负数")
+            new_lines.extend(build_deepstream_source_block(template, index, by_index[index]))
+        output[insert_at:insert_at] = new_lines
     path.write_text("\n".join(output) + "\n", encoding="utf-8")
+
+
+def delete_deepstream_source(path: Path, index: int) -> dict[str, Any]:
+    text = path.read_text(encoding="utf-8")
+    lines = text.splitlines()
+    sources = {item["index"]: item for item in parse_deepstream_sources(path)}
+    if index not in sources:
+        raise ValueError(f"source{index} 不存在")
+    for source_index, start, end in find_deepstream_source_blocks(lines):
+        if source_index != index:
+            continue
+        del lines[start:end]
+        path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+        return sources[index]
+    raise ValueError(f"source{index} 不存在")
 
 
 def parse_rtsp_target(uri: str) -> tuple[str | None, int | None]:
@@ -484,6 +611,117 @@ def check_rtsp_connectivity(uri: str) -> dict[str, Any]:
         sock.close()
 
 
+def sanitize_rtsp_error_message(message: str, uri: str) -> str:
+    text = message or ""
+    if uri:
+        text = text.replace(uri, "[RTSP地址]")
+    parsed = urlparse(uri)
+    if parsed.username and parsed.hostname:
+        auth_host = f"{parsed.username}"
+        if parsed.password:
+            auth_host += f":{parsed.password}"
+        auth_host += f"@{parsed.hostname}"
+        text = text.replace(auth_host, f"***@{parsed.hostname}")
+    return text
+
+
+def classify_rtsp_error(message: str) -> tuple[str, str]:
+    text = (message or "").lower()
+    if any(key in text for key in ["unauthorized", "401", "authentication", "not authorized", "permission denied"]):
+        return "auth_failed", "RTSP 认证失败，请检查相机账号或密码"
+    if any(key in text for key in ["404", "not found", "not-found"]):
+        return "path_failed", "RTSP 路径不存在，请检查视频流路径"
+    if any(key in text for key in ["timeout", "timed out", "connection timed out"]):
+        return "timeout", "视频流拉流超时，请检查网络、相机负载或 RTSP 地址"
+    if any(key in text for key in ["connection refused", "could not connect", "no route to host", "network is unreachable"]):
+        return "connect_failed", "无法连接相机视频流端口，请检查相机网络或端口"
+    if any(key in text for key in ["could not open resource", "open resource"]):
+        return "open_failed", "无法打开 RTSP 视频流，请检查地址、账号、密码或路径"
+    if "not-linked" in text:
+        return "no_video", "已连接到 RTSP，但未识别到视频流"
+    return "stream_failed", "视频流拉流失败，请检查账号、密码、路径和相机状态"
+
+
+def gst_output_confirms_stream(message: str) -> bool:
+    text = (message or "").lower()
+    success_markers = [
+        "setting pipeline to playing",
+        "new clock",
+        "stream-start",
+        "gstmessage-stream-start",
+        "async-done",
+        "pipeline is live and does not need preroll",
+        "pipeline is prerolled",
+        "redistribute latency",
+    ]
+    return any(marker in text for marker in success_markers)
+
+
+def check_rtsp_stream(uri: str, timeout: int = 8) -> dict[str, Any]:
+    if not uri:
+        return {"ok": False, "reason": "empty_uri", "message": "RTSP 地址为空"}
+    parsed = urlparse(uri)
+    if parsed.scheme.lower() != "rtsp" or not parsed.hostname:
+        return {"ok": False, "reason": "invalid_uri", "message": "RTSP 地址格式无效"}
+
+    tcp_result = tcp_check(parsed.hostname, parsed.port or 554, timeout_sec=2.0)
+    if not tcp_result["ok"]:
+        return {
+            "ok": False,
+            "reason": "connect_failed",
+            "message": f"RTSP 端口不可达：{tcp_result['message']}",
+        }
+
+    gst_launch = shutil.which("gst-launch-1.0")
+    if not gst_launch:
+        return {"ok": False, "reason": "missing_tool", "message": "缺少 gst-launch-1.0，无法按 DeepStream/GStreamer 链路验证拉流"}
+
+    cmd = [
+        gst_launch,
+        "-m",
+        "rtspsrc",
+        f"location={uri}",
+        "protocols=tcp",
+        "latency=200",
+        "timeout=5000000",
+        "!",
+        "application/x-rtp,media=video",
+        "!",
+        "fakesink",
+        "sync=false",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
+        raw_output = (result.stderr or "") + "\n" + (result.stdout or "")
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        raw_output = f"{stderr}\n{stdout}"
+        if gst_output_confirms_stream(raw_output):
+            return {"ok": True, "reason": "stream_ok", "message": "GStreamer 已进入播放状态，视频流可用"}
+        raw_message = sanitize_rtsp_error_message(raw_output.strip() or "GStreamer 未确认收到视频流", uri)
+        detail = raw_message[:200]
+        message = "视频流拉流超时，未确认进入播放或收到视频流"
+        if detail:
+            message = f"{message}；详情：{detail}"
+        return {"ok": False, "reason": "timeout", "message": message[:260]}
+    if result.returncode == 0 and gst_output_confirms_stream(raw_output):
+        return {"ok": True, "reason": "stream_ok", "message": "GStreamer 拉流正常"}
+    if result.returncode == 0:
+        raw_message = sanitize_rtsp_error_message(raw_output.strip() or "GStreamer 未确认收到视频流", uri)
+        detail = raw_message[:200]
+        message = "GStreamer 退出但未确认进入播放或收到视频流"
+        if detail:
+            message = f"{message}；详情：{detail}"
+        return {"ok": False, "reason": "no_video", "message": message[:260]}
+    raw_message = sanitize_rtsp_error_message((raw_output or "GStreamer 拉流失败").strip(), uri)
+    reason, friendly_message = classify_rtsp_error(raw_message)
+    detail = raw_message[:200]
+    if detail and detail != friendly_message:
+        friendly_message = f"{friendly_message}；详情：{detail}"
+    return {"ok": False, "reason": reason, "message": friendly_message[:260]}
+
+
 def ping_host(host: str, count: int = 1) -> dict[str, Any]:
     if not host:
         return {"ok": False, "message": "未提供主机地址"}
@@ -521,6 +759,161 @@ def get_signal_checks(host: str, port: int, force: bool = False) -> tuple[dict[s
     tcp_result = tcp_check(host, port, timeout_sec=0.8)
     _SIGNAL_CHECK_CACHE = (now, host, port, ping_result, tcp_result)
     return ping_result, tcp_result
+
+
+def step_tool_csrf_opener() -> tuple[urlrequest.OpenerDirector, str, str]:
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urlrequest.build_opener(urlrequest.HTTPCookieProcessor(cookie_jar))
+    login_url = f"{STEP_TOOL_BASE_URL}{STEP_TOOL_CSRF_PATH}"
+    try:
+        with opener.open(login_url, timeout=STEP_TOOL_TIMEOUT) as response:
+            html = response.read().decode("utf-8", errors="replace")
+            final_url = response.geturl()
+    except Exception as exc:
+        raise RuntimeError(f"无法获取智能控制安全令牌：{exc}") from exc
+    match = re.search(r'name=["\']_csrf["\'][^>]*value=["\']([^"\']+)["\']', html)
+    if not match:
+        match = re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']_csrf["\']', html)
+    if not match:
+        raise RuntimeError("智能控制未返回安全令牌，请确认服务登录页是否正常")
+    return opener, match.group(1), final_url or login_url
+
+
+def step_tool_login_session() -> tuple[urlrequest.OpenerDirector, str, str]:
+    opener, csrf_token, login_url = step_tool_csrf_opener()
+    payload = urlencode(
+        {
+            "username": STEP_TOOL_LOGIN_USERNAME,
+            "password": STEP_TOOL_LOGIN_PASSWORD,
+            "_csrf": csrf_token,
+        }
+    ).encode("utf-8")
+    headers = {
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": step_tool_origin(),
+        "Referer": login_url,
+        "User-Agent": "box-config-tool/1.0",
+    }
+    req = urlrequest.Request(login_url, data=payload, headers=headers, method="POST")
+    try:
+        with opener.open(req, timeout=STEP_TOOL_TIMEOUT) as response:
+            html = response.read().decode("utf-8", errors="replace")
+            final_url = response.geturl()
+    except urlerror.URLError as exc:
+        raise RuntimeError(f"无法登录智能控制平台：{exc}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("登录智能控制平台超时") from exc
+    if final_url.rstrip("/").endswith("/login"):
+        raise RuntimeError(
+            f"智能控制平台网页登录失败，请检查固定账号密码是否仍为 {STEP_TOOL_LOGIN_USERNAME}/{STEP_TOOL_LOGIN_PASSWORD}"
+        )
+    match = re.search(r'name=["\']_csrf["\'][^>]*value=["\']([^"\']+)["\']', html)
+    if not match:
+        match = re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']_csrf["\']', html)
+    session_csrf = match.group(1) if match else csrf_token
+    return opener, session_csrf, final_url or login_url
+
+
+def step_tool_origin() -> str:
+    parsed = urlparse(STEP_TOOL_BASE_URL)
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def step_tool_headers(csrf_token: str | None = None, referer: str | None = None) -> dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "box-config-tool/1.0",
+    }
+    if csrf_token:
+        headers.update(
+            {
+                "X-CSRF-TOKEN": csrf_token,
+                "X-Requested-With": "XMLHttpRequest",
+                "Origin": step_tool_origin(),
+                "Referer": referer or f"{STEP_TOOL_BASE_URL}{STEP_TOOL_CSRF_PATH}",
+            }
+        )
+    return headers
+
+
+def step_tool_decode_json(raw: str, final_url: str) -> dict[str, Any]:
+    if final_url.rstrip("/").endswith("/login"):
+        raise RuntimeError("智能控制要求安全令牌或登录态，当前请求被重定向到登录页")
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("智能控制返回内容不是有效 JSON") from exc
+    if result.get("code") != 200:
+        raise RuntimeError(str(result.get("message") or "智能控制接口返回失败"))
+    return result
+
+
+def step_tool_request(
+    path: str,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+    session: tuple[urlrequest.OpenerDirector, str, str] | None = None,
+) -> dict[str, Any]:
+    url = f"{STEP_TOOL_BASE_URL}{path}"
+    headers = step_tool_headers()
+    data = None
+    if session is None:
+        opener, csrf_token, referer = step_tool_login_session()
+    else:
+        opener, csrf_token, referer = session
+    if method.upper() not in ("GET", "HEAD"):
+        headers = step_tool_headers(csrf_token=csrf_token, referer=referer)
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urlrequest.Request(url, data=data, headers=headers, method=method)
+    try:
+        with opener.open(req, timeout=STEP_TOOL_TIMEOUT) as response:
+            raw = response.read().decode("utf-8")
+            final_url = response.geturl()
+    except urlerror.URLError as exc:
+        raise RuntimeError(f"无法连接智能控制服务：{exc}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("连接智能控制服务超时") from exc
+    return step_tool_decode_json(raw, final_url)
+
+
+def step_tool_upload(path: str, filename: str, content: bytes, mimetype: str) -> dict[str, Any]:
+    url = f"{STEP_TOOL_BASE_URL}{path}"
+    opener, csrf_token, referer = step_tool_login_session()
+    boundary = f"----box-config-tool-{uuid.uuid4().hex}"
+    safe_filename = Path(filename or "config.json").name.replace('"', "")
+    content_type = mimetype or "application/octet-stream"
+    body = b"".join(
+        [
+            f"--{boundary}\r\n".encode("utf-8"),
+            f'Content-Disposition: form-data; name="file"; filename="{safe_filename}"\r\n'.encode("utf-8"),
+            f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+            content,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]
+    )
+    req = urlrequest.Request(
+        url,
+        data=body,
+        headers={
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+            **step_tool_headers(csrf_token=csrf_token, referer=referer),
+        },
+        method="POST",
+    )
+    try:
+        with opener.open(req, timeout=STEP_TOOL_TIMEOUT) as response:
+            raw = response.read().decode("utf-8")
+            final_url = response.geturl()
+    except urlerror.URLError as exc:
+        raise RuntimeError(f"无法连接智能控制服务：{exc}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("连接智能控制服务超时") from exc
+    return step_tool_decode_json(raw, final_url)
 
 
 def load_camera_aliases() -> dict[str, str]:
@@ -567,14 +960,64 @@ def build_camera_bindings() -> list[dict[str, Any]]:
     return cameras
 
 
+def camera_check_items_from_request() -> list[dict[str, Any]]:
+    body = request.get_json(silent=True) or {}
+    raw_items = body.get("items")
+    if not isinstance(raw_items, list):
+        return build_camera_bindings()
+
+    items = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            index = int(raw.get("index", len(items)))
+        except (TypeError, ValueError):
+            index = len(items)
+        host = str(raw.get("host", "")).strip()
+        username = str(raw.get("username", "")).strip()
+        password = str(raw.get("password", "")).strip()
+        path = str(raw.get("path", "/ch1/main")).strip() or "/ch1/main"
+        try:
+            port = int(raw.get("port", 554) or 554)
+        except (TypeError, ValueError):
+            port = 554
+        uri = str(raw.get("uri", "")).strip()
+        if not uri and host:
+            uri = generate_rtsp_uri(host, username, password, port, path)
+        if not host and uri:
+            parsed_host, parsed_port = parse_rtsp_target(uri)
+            host = parsed_host
+            port = parsed_port
+        items.append(
+            {
+                "index": index,
+                "name": str(raw.get("name", f"CAM_{index:02d}")),
+                "enable": bool(raw.get("enable", True)),
+                "host": host,
+                "port": port,
+                "uri": uri,
+            }
+        )
+    return items
+
+
 def save_camera_bindings(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     current_sources = {item["index"]: item for item in parse_deepstream_sources(DEEPSTREAM_CONFIG_PATH)}
     aliases = load_camera_aliases()
     updates = []
+    seen_indices = set()
     for item in items:
         idx = int(item["index"])
-        current = current_sources[idx]
-        uri = str(item.get("uri", current["uri"])).strip()
+        if idx < 0:
+            raise ValueError("source id 不能为负数")
+        if idx in seen_indices:
+            raise ValueError(f"source{idx} 重复，请刷新页面后重试")
+        seen_indices.add(idx)
+        current = current_sources.get(idx)
+        default_enable = current["enable"] if current else True
+        default_uri = current["uri"] if current else ""
+        uri = str(item.get("uri", default_uri)).strip()
         host = str(item.get("host", "")).strip()
         username = str(item.get("username", "")).strip()
         password = str(item.get("password", "")).strip()
@@ -588,7 +1031,10 @@ def save_camera_bindings(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             raise ValueError(f"source{idx}.port 必须是数字")
         if host:
             uri = generate_rtsp_uri(host, username, password, port, path)
-        updates.append({"index": idx, "enable": bool(item.get("enable", current["enable"])), "uri": uri})
+        enable = bool(item.get("enable", default_enable))
+        if enable and not uri:
+            raise ValueError(f"source{idx} 启用时 RTSP 不能为空")
+        updates.append({"index": idx, "enable": enable, "uri": uri})
         aliases[str(idx)] = str(item.get("name", aliases.get(str(idx), f"CAM_{idx:02d}"))).strip() or f"CAM_{idx:02d}"
     update_deepstream_sources(DEEPSTREAM_CONFIG_PATH, updates)
     save_camera_aliases(aliases)
@@ -602,15 +1048,36 @@ def latest_csv_file(prefix: str) -> Path | None:
     return max(files, key=lambda path: path.stat().st_mtime)
 
 
+def read_csv_tail_rows(path: Path, max_lines: int = 12) -> tuple[str, list[str]]:
+    with path.open("rb") as handle:
+        header = handle.readline().decode("utf-8", errors="ignore").strip()
+        handle.seek(0, os.SEEK_END)
+        pos = handle.tell()
+        tail = b""
+        block_size = 8192
+        while pos > 0 and tail.count(b"\n") <= max_lines:
+            read_size = min(block_size, pos)
+            pos -= read_size
+            handle.seek(pos)
+            tail = handle.read(read_size) + tail
+    rows = [line for line in tail.decode("utf-8", errors="ignore").splitlines() if line.strip()]
+    if rows and rows[0].strip() == header:
+        rows = rows[1:]
+    return header, rows[-max_lines:]
+
+
 def read_latest_csv_summary(prefix: str) -> dict[str, Any]:
     path = latest_csv_file(prefix)
     if path is None:
         return {"file": None, "updated_at": None, "top": []}
-    last_row = None
-    with path.open("r", encoding="utf-8") as handle:
-        reader = csv.DictReader(handle)
-        for row in reader:
-            last_row = row
+    try:
+        header, data_lines = read_csv_tail_rows(path, max_lines=8)
+        if not data_lines:
+            return {"file": str(path), "updated_at": None, "top": []}
+        reader = csv.DictReader(StringIO(header + "\n" + data_lines[-1] + "\n"))
+        last_row = next(reader, None)
+    except Exception as exc:
+        return {"file": str(path), "updated_at": None, "top": [], "error": str(exc)}
     if not last_row:
         return {"file": str(path), "updated_at": None, "top": []}
     metrics = []
@@ -635,14 +1102,226 @@ def read_latest_csv_summary(prefix: str) -> dict[str, Any]:
     }
 
 
+def load_base_length_summary() -> dict[str, float]:
+    path = CALIBRATION_FILES.get("base_length")
+    if not path or not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, float] = {}
+    for key, value in payload.items():
+        try:
+            result[str(key)] = round(float(value), 2)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def read_metric_window(prefix: str, minutes: int, mode: str) -> dict[str, Any]:
+    safe_minutes = max(1, min(int(minutes or 3), 1440))
+    path = latest_csv_file(prefix)
+    if path is None:
+        return {"file": None, "minutes": safe_minutes, "lanes": [], "by_lane": {}, "rows": 0, "updated_at": None}
+    max_lines = min(max(int(safe_minutes * 65) + 30, 400), 100000)
+    try:
+        header, data_lines = read_csv_tail_rows(path, max_lines=max_lines)
+        if not data_lines:
+            return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "rows": 0, "updated_at": None}
+        reader = csv.DictReader(StringIO(header + "\n" + "\n".join(data_lines) + "\n"))
+        rows = list(reader)
+        latest_ts = None
+        latest_dt = None
+        for row in reversed(rows):
+            try:
+                latest_ts = float(row.get("ts", ""))
+                latest_dt = row.get("dateTime")
+                break
+            except (TypeError, ValueError):
+                continue
+        if latest_ts is None:
+            return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "rows": 0, "updated_at": None}
+        start_ts = latest_ts - safe_minutes * 60
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        used_rows = 0
+        for row in rows:
+            try:
+                row_ts = float(row.get("ts", ""))
+            except (TypeError, ValueError):
+                continue
+            if row_ts < start_ts:
+                continue
+            used_rows += 1
+            for key, value in row.items():
+                if not key.startswith("lane_"):
+                    continue
+                lane = key.replace("lane_", "")
+                try:
+                    num = float(value or 0)
+                except (TypeError, ValueError):
+                    continue
+                if mode == "sum":
+                    sums[lane] = sums.get(lane, 0.0) + num
+                    counts[lane] = counts.get(lane, 0) + 1
+                elif mode == "avg_positive":
+                    if num > 0:
+                        sums[lane] = sums.get(lane, 0.0) + num
+                        counts[lane] = counts.get(lane, 0) + 1
+                else:
+                    sums[lane] = sums.get(lane, 0.0) + num
+                    counts[lane] = counts.get(lane, 0) + 1
+
+        def lane_sort_key(lane: str) -> tuple[int, Any]:
+            return (0, int(lane)) if lane.isdigit() else (1, lane)
+
+        lanes = sorted(set(sums.keys()) | set(counts.keys()), key=lane_sort_key)
+        by_lane: dict[str, float] = {}
+        for lane in lanes:
+            if mode == "sum":
+                by_lane[lane] = round(sums.get(lane, 0.0), 2)
+            else:
+                count = counts.get(lane, 0)
+                by_lane[lane] = round((sums.get(lane, 0.0) / count) if count > 0 else 0.0, 2)
+        return {
+            "file": str(path),
+            "minutes": safe_minutes,
+            "lanes": lanes,
+            "by_lane": by_lane,
+            "rows": used_rows,
+            "updated_at": latest_dt,
+        }
+    except Exception as exc:
+        return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "rows": 0, "updated_at": None, "error": str(exc)}
+
+
+def read_recent_lane_metrics_summary(minutes: int = 3) -> dict[str, Any]:
+    safe_minutes = max(1, min(int(minutes or 3), 1440))
+    flow = read_metric_window("flow", safe_minutes, mode="sum")
+    headway = read_metric_window("headway", safe_minutes, mode="avg_positive")
+    queue = read_metric_window("queueLen", safe_minutes, mode="avg")
+    base_lengths = load_base_length_summary()
+
+    def lane_sort_key(lane: str) -> tuple[int, Any]:
+        return (0, int(lane)) if lane.isdigit() else (1, lane)
+
+    lanes = sorted(
+        set(flow.get("lanes", [])) | set(headway.get("lanes", [])) | set(queue.get("lanes", [])) | set(base_lengths.keys()),
+        key=lane_sort_key,
+    )
+    flow_by_lane = {lane: round(float(flow.get("by_lane", {}).get(lane, 0.0)), 2) for lane in lanes}
+    headway_by_lane = {lane: round(float(headway.get("by_lane", {}).get(lane, 0.0)), 2) for lane in lanes}
+    base_by_lane = {lane: round(float(base_lengths.get(lane, 0.0)), 2) for lane in lanes}
+    queue_avg_by_lane: dict[str, float] = {}
+    queue_increment_by_lane: dict[str, float] = {}
+    for lane in lanes:
+        base_val = base_by_lane[lane]
+        measured_avg = round(float(queue.get("by_lane", {}).get(lane, 0.0)), 2)
+        increment_avg = round(max(measured_avg - base_val, 0.0), 2)
+        queue_increment_by_lane[lane] = increment_avg
+        queue_avg_by_lane[lane] = round(base_val + increment_avg, 2)
+    updated_candidates = [item.get("updated_at") for item in (flow, headway, queue) if item.get("updated_at")]
+    return {
+        "minutes": safe_minutes,
+        "updated_at": updated_candidates[0] if updated_candidates else None,
+        "lanes": lanes,
+        "flow_total": flow_by_lane,
+        "headway_avg": headway_by_lane,
+        "base_queue": base_by_lane,
+        "queue_increment_avg": queue_increment_by_lane,
+        "queue_avg": queue_avg_by_lane,
+        "rows_used": {
+            "flow": flow.get("rows", 0),
+            "headway": headway.get("rows", 0),
+            "queue": queue.get("rows", 0),
+        },
+    }
+
+
+def read_flow_window_summary(minutes: int) -> dict[str, Any]:
+    safe_minutes = max(1, min(int(minutes or 60), 1440))
+    path = latest_csv_file("flow")
+    if path is None:
+        return {"file": None, "minutes": safe_minutes, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
+    max_lines = min(max(int(safe_minutes * 65) + 30, 400), 100000)
+    try:
+        header, data_lines = read_csv_tail_rows(path, max_lines=max_lines)
+        if not data_lines:
+            return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
+        reader = csv.DictReader(StringIO(header + "\n" + "\n".join(data_lines) + "\n"))
+        rows = list(reader)
+        latest_ts = None
+        for row in reversed(rows):
+            try:
+                latest_ts = float(row.get("ts", ""))
+                break
+            except (TypeError, ValueError):
+                continue
+        if latest_ts is None:
+            return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
+        start_ts = latest_ts - safe_minutes * 60
+        sums: dict[str, float] = {}
+        used_rows = 0
+        for row in rows:
+            try:
+                row_ts = float(row.get("ts", ""))
+            except (TypeError, ValueError):
+                continue
+            if row_ts < start_ts:
+                continue
+            used_rows += 1
+            for key, value in row.items():
+                if not key.startswith("lane_"):
+                    continue
+                lane = key.replace("lane_", "")
+                try:
+                    sums[lane] = sums.get(lane, 0.0) + float(value or 0)
+                except (TypeError, ValueError):
+                    continue
+
+        def lane_sort_key(lane: str) -> tuple[int, Any]:
+            return (0, int(lane)) if lane.isdigit() else (1, lane)
+
+        lanes = sorted(sums.keys(), key=lane_sort_key)
+        by_lane = {lane: round(sums[lane], 2) for lane in lanes}
+        total = round(sum(by_lane.values()), 2)
+        return {
+            "file": str(path),
+            "minutes": safe_minutes,
+            "lanes": lanes,
+            "by_lane": by_lane,
+            "total": total,
+            "rows": used_rows,
+            "start_ts": start_ts,
+            "end_ts": latest_ts,
+        }
+    except Exception as exc:
+        return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "total": 0, "rows": 0, "error": str(exc)}
+
+
 def read_recent_log_events(limit: int = 12) -> list[str]:
     path = TRAFFIC_LOG_DIR / "runtime_main.log"
     if not path.exists():
         return []
     lines: deque[str] = deque(maxlen=200)
-    with path.open("r", encoding="utf-8", errors="ignore") as handle:
-        for line in handle:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            pos = handle.tell()
+            tail = b""
+            block_size = 8192
+            while pos > 0 and tail.count(b"\n") <= 400:
+                read_size = min(block_size, pos)
+                pos -= read_size
+                handle.seek(pos)
+                tail = handle.read(read_size) + tail
+        for line in tail.decode("utf-8", errors="ignore").splitlines():
             lines.append(line.rstrip())
+    except Exception as exc:
+        return [f"读取日志失败: {exc}"]
     interesting = [
         line
         for line in lines
@@ -670,13 +1349,11 @@ def get_calibration_status() -> list[dict[str, Any]]:
 
 def runtime_summary() -> dict[str, Any]:
     active_interface = get_active_interface()
-    current_network = get_network_info(active_interface) if active_interface else {}
     signal_config = get_signal_controller_config()
     signal_ping, signal_tcp = get_signal_checks(signal_config["host"], signal_config["port"])
     return {
         "hostname": get_hostname(),
         "active_interface": active_interface,
-        "current_network": current_network,
         "services": [service_status(name) for name in SERVICES],
         "signal_controller": {
             "host": signal_config["host"],
@@ -684,13 +1361,14 @@ def runtime_summary() -> dict[str, Any]:
             "ping": signal_ping,
             "tcp": signal_tcp,
         },
-        "metrics": {
-            "flow": read_latest_csv_summary("flow"),
-            "headway": read_latest_csv_summary("headway"),
-            "queue": read_latest_csv_summary("queueLen"),
-        },
+    }
+
+
+def data_summary(minutes: int = 60) -> dict[str, Any]:
+    return {
+        "latest_metrics_3m": read_recent_lane_metrics_summary(3),
+        "flow_window": read_flow_window_summary(minutes),
         "recent_events": read_recent_log_events(),
-        "calibration": get_calibration_status(),
     }
 
 
@@ -838,24 +1516,118 @@ def api_camera_bindings_save():
     items = body.get("items")
     if not isinstance(items, list):
         return jsonify({"ok": False, "message": "items 必须是数组"}), 400
+    before_sources = parse_deepstream_sources(DEEPSTREAM_CONFIG_PATH)
+    before_stream_map = {
+        int(item["index"]): {
+            "enable": bool(item["enable"]),
+            "uri": str(item["uri"]),
+        }
+        for item in before_sources
+    }
     try:
         cameras = save_camera_bindings(items)
     except ValueError as exc:
         return jsonify({"ok": False, "message": str(exc)}), 400
+    after_stream_map = {
+        int(item["index"]): {
+            "enable": bool(item["enable"]),
+            "uri": str(item["uri"]),
+        }
+        for item in parse_deepstream_sources(DEEPSTREAM_CONFIG_PATH)
+    }
+    stream_changed = before_stream_map != after_stream_map
+    restart_result = None
+    if stream_changed:
+        restart_result = run_command(["systemctl", "restart", "traffic_detect.service"], require_root=True, timeout=40)
+        if not restart_result["ok"]:
+            log_line("[CAMERA] 已更新相机绑定配置，但自动重启 traffic_detect.service 失败")
+            return jsonify(
+                {
+                    "ok": False,
+                    "message": restart_result["stderr"] or restart_result["stdout"] or "相机绑定已保存，但自动重启路口感知检测服务失败",
+                    "items": cameras,
+                    "stream_changed": stream_changed,
+                }
+            ), 500
     log_line("[CAMERA] 已更新相机绑定配置")
-    return jsonify({"ok": True, "message": "相机绑定已保存", "items": cameras})
+    message = "相机绑定已保存"
+    if stream_changed:
+        message = "相机绑定已保存，路口感知检测服务已自动重启"
+    return jsonify(
+        {
+            "ok": True,
+            "message": message,
+            "items": cameras,
+            "stream_changed": stream_changed,
+            "restart": restart_result,
+        }
+    )
+
+
+@app.post("/api/camera-bindings/<int:index>/delete")
+def api_camera_binding_delete(index: int):
+    if index < 0:
+        return jsonify({"ok": False, "message": "source id 不能为负数"}), 400
+    try:
+        deleted_source = delete_deepstream_source(DEEPSTREAM_CONFIG_PATH, index)
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 404
+    aliases = load_camera_aliases()
+    aliases.pop(str(index), None)
+    save_camera_aliases(aliases)
+    restart_result = run_command(["systemctl", "restart", "traffic_detect.service"], require_root=True, timeout=40)
+    cameras = build_camera_bindings()
+    if not restart_result["ok"]:
+        log_line(f"[CAMERA] 已彻底删除 source{index}，但自动重启 traffic_detect.service 失败")
+        return jsonify(
+            {
+                "ok": False,
+                "message": restart_result["stderr"] or restart_result["stdout"] or "source 已删除，但自动重启路口感知检测服务失败",
+                "items": cameras,
+                "deleted": deleted_source,
+            }
+        ), 500
+    log_line(f"[CAMERA] 已彻底删除 source{index}")
+    return jsonify(
+        {
+            "ok": True,
+            "message": f"source{index} 已彻底删除，路口感知检测服务已自动重启",
+            "items": cameras,
+            "deleted": deleted_source,
+            "restart": restart_result,
+        }
+    )
 
 
 @app.post("/api/camera-bindings/check")
 def api_camera_bindings_check():
-    items = build_camera_bindings()
+    items = camera_check_items_from_request()
     results = []
     for item in items:
         if not item["enable"]:
-            results.append({"index": item["index"], "ok": True, "message": "未启用，已跳过"})
+            results.append(
+                {
+                    "index": item["index"],
+                    "ok": True,
+                    "message": "未启用，已跳过",
+                    "ping": {"ok": True, "message": "未启用，已跳过"},
+                    "stream": {"ok": True, "message": "未启用，已跳过"},
+                }
+            )
             continue
-        result = tcp_check(item["host"], item["port"] or 554)
-        results.append({"index": item["index"], "name": item["name"], "host": item["host"], **result})
+        ping_result = ping_host(item["host"], count=1)
+        stream_result = check_rtsp_stream(item["uri"])
+        results.append(
+            {
+                "index": item["index"],
+                "name": item["name"],
+                "host": item["host"],
+                "uri": item["uri"],
+                "ok": bool(ping_result.get("ok") and stream_result.get("ok")),
+                "ping": ping_result,
+                "stream": stream_result,
+            }
+        )
     return jsonify({"ok": True, "results": results})
 
 
@@ -867,6 +1639,24 @@ def api_calibration_status():
 @app.get("/api/runtime-summary")
 def api_runtime_summary():
     return jsonify({"ok": True, "summary": runtime_summary()})
+
+
+@app.get("/api/data-summary")
+def api_data_summary():
+    raw_minutes = request.args.get("minutes")
+    if raw_minutes is None and request.args.get("hours") is not None:
+        try:
+            raw_minutes = str(round(float(request.args.get("hours", "1")) * 60))
+        except (TypeError, ValueError):
+            raw_minutes = "60"
+    raw_minutes = raw_minutes or "60"
+    try:
+        minutes = int(raw_minutes)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "统计时长必须是整数分钟"}), 400
+    if not (1 <= minutes <= 1440):
+        return jsonify({"ok": False, "message": "统计分钟数必须在 1 到 1440 之间"}), 400
+    return jsonify({"ok": True, "summary": data_summary(minutes)})
 
 
 @app.get("/api/signal-controller")
@@ -944,6 +1734,383 @@ def api_signal_controller_save():
                 "ping": signal_ping,
                 "tcp": signal_tcp,
             },
+        }
+    )
+
+
+@app.get("/api/step-tool/status")
+def api_step_tool_status():
+    try:
+        result = step_tool_request("/api/v1/status")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc), "online": False}), 502
+    online = result.get("data") is True
+    return jsonify(
+        {
+            "ok": True,
+            "message": "智能控制在线" if online else "智能控制离线",
+            "online": online,
+            "raw": result,
+        }
+    )
+
+
+@app.get("/api/step-tool/service-status")
+def api_step_tool_service_status():
+    try:
+        result = step_tool_request("/api/v1/service/status")
+    except RuntimeError as exc:
+        fallback = tcp_check("127.0.0.1", 8080, timeout_sec=1.0)
+        if fallback["ok"]:
+            return jsonify(
+                {
+                    "ok": True,
+                    "message": "智能控制服务端口已开启，但 /api/v1/service/status 暂未返回 JSON",
+                    "running": True,
+                    "fallback": True,
+                    "detail": str(exc),
+                }
+            )
+        return jsonify({"ok": False, "message": str(exc), "running": False, "fallback": True}), 502
+    data = result.get("data")
+    if isinstance(data, bool):
+        running = data
+    elif isinstance(data, str):
+        running = data.strip().lower() in ("true", "1", "running", "active", "open", "on")
+    elif isinstance(data, dict):
+        running = any(
+            data.get(key) is True or str(data.get(key)).strip().lower() in ("true", "1", "running", "active", "open", "on")
+            for key in ("running", "active", "online", "status", "serviceStatus")
+        )
+    else:
+        running = bool(data)
+    return jsonify(
+        {
+            "ok": True,
+            "message": "智能控制服务已开启" if running else "智能控制服务未开启",
+            "running": running,
+            "raw": result,
+        }
+    )
+
+
+@app.post("/api/step-tool/restart-service")
+def api_step_tool_restart_service():
+    service_name = "preplan-control.service"
+    result = run_command(["systemctl", "restart", service_name], require_root=True, timeout=40)
+    if not result["ok"]:
+        return jsonify({"ok": False, "message": result["stderr"] or result["stdout"] or "智能控制服务重启失败"}), 500
+    log_line(f"[STEP] restart {service_name}")
+    return jsonify({"ok": True, "message": "智能控制服务已重启，请稍后重新查询状态"})
+
+
+def normalize_step_tool_config(body: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    host = str(body.get("ip") or body.get("host") or "").strip()
+    username = str(body.get("username") or "").strip()
+    password = str(body.get("password") or "")
+    port_raw = body.get("port")
+    try:
+        ensure_ipv4(host, "信号机 IP")
+    except ValueError as exc:
+        return None, str(exc)
+    if not username:
+        return None, "账户不能为空"
+    if not password:
+        return None, "密码不能为空"
+    try:
+        port = int(port_raw)
+    except (TypeError, ValueError):
+        return None, "端口号必须是数字"
+    if not (1 <= port <= 65535):
+        return None, "端口号超出范围"
+    return {"ip": host, "port": port, "username": username, "password": password}, None
+
+
+def phase_id_from_status(data: dict[str, Any]) -> int | None:
+    sorted_phase_status = data.get("sortedPhaseStatus")
+    if isinstance(sorted_phase_status, list):
+        for item in sorted_phase_status:
+            if isinstance(item, dict) and item.get("phaseID") is not None:
+                try:
+                    return int(item["phaseID"])
+                except (TypeError, ValueError):
+                    continue
+    phase_ring = data.get("phaseRing")
+    if isinstance(phase_ring, list):
+        for item in phase_ring:
+            try:
+                return int(item)
+            except (TypeError, ValueError):
+                continue
+    phase_status = data.get("phaseStatus")
+    if isinstance(phase_status, dict):
+        for key, item in phase_status.items():
+            phase_id = item.get("phaseID") if isinstance(item, dict) else key
+            try:
+                return int(phase_id)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+@app.post("/api/step-tool/tsc-config")
+def api_step_tool_tsc_config():
+    body = request.get_json(force=True)
+    payload, error_message = normalize_step_tool_config(body)
+    if error_message:
+        return jsonify({"ok": False, "message": error_message}), 400
+
+    try:
+        session = step_tool_csrf_opener()
+        test_result = step_tool_request(
+            "/api/v1/tsc/connection/test",
+            method="POST",
+            payload=payload,
+            session=session,
+        )
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 502
+    test_success = test_result.get("data") is not False
+    if not test_success:
+        return jsonify(
+            {
+                "ok": False,
+                "message": str(test_result.get("message") or "信号机登录测试失败"),
+                "success": False,
+                "connection_test": test_result,
+            }
+        ), 502
+    try:
+        result = step_tool_request(
+            "/api/v1/tsc/config",
+            method="POST",
+            payload=payload,
+            session=session,
+        )
+    except RuntimeError as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "message": f"信号机登录测试成功，但保存参数失败：{exc}",
+                "success": False,
+                "connection_test": test_result,
+            }
+        ), 502
+    success = result.get("data") is not False
+    if not success:
+        return jsonify(
+            {
+                "ok": False,
+                "message": str(result.get("message") or "信号机登录测试成功，但保存参数失败"),
+                "success": False,
+                "raw": result,
+                "connection_test": test_result,
+            }
+        ), 502
+    return jsonify(
+        {
+            "ok": True,
+            "message": str(result.get("message") or "信号机登录测试成功，参数已保存"),
+            "success": True,
+            "raw": result,
+            "connection_test": test_result,
+        }
+    )
+
+
+@app.post("/api/step-tool/tsc-connection-test")
+def api_step_tool_tsc_connection_test():
+    body = request.get_json(force=True)
+    payload, error_message = normalize_step_tool_config(body)
+    if error_message:
+        return jsonify({"ok": False, "message": error_message}), 400
+    try:
+        result = step_tool_request("/api/v1/tsc/connection/test", method="POST", payload=payload)
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc), "success": False}), 502
+    success = result.get("data") is not False
+    return jsonify(
+        {
+            "ok": success,
+            "message": str(result.get("message") or ("信号机登录测试成功" if success else "信号机登录测试失败")),
+            "success": success,
+            "raw": result,
+        }
+    ), 200 if success else 502
+
+
+@app.get("/api/step-tool/tsc-config")
+def api_step_tool_tsc_config_get():
+    try:
+        result = step_tool_request("/api/v1/tsc/config")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 502
+    data = result.get("data") or {}
+    return jsonify(
+        {
+            "ok": True,
+            "message": str(result.get("message") or "当前参数读取成功"),
+            "config": {
+                "ip": data.get("ip") or "",
+                "port": data.get("port") or "",
+                "username": data.get("username") or "",
+                "password": data.get("password") or "",
+            },
+            "raw": result,
+        }
+    )
+
+
+@app.get("/api/step-tool/tsc-status")
+def api_step_tool_tsc_status():
+    try:
+        result = step_tool_request("/api/v1/tsc/status")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 502
+    data = result.get("data") or {}
+    ctrl_mode = data.get("ctrlMode")
+    try:
+        ctrl_mode_id = int(ctrl_mode)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "智能控制返回的控制模式无效", "raw": result}), 502
+    label = CTRL_MODE_LABELS.get(ctrl_mode_id, f"未知控制模式 {ctrl_mode_id}")
+    return jsonify(
+        {
+            "ok": True,
+            "message": f"当前控制模式：{label}",
+            "ctrl_mode": ctrl_mode_id,
+            "ctrl_mode_label": label,
+            "step_control": bool(data.get("stepControl")),
+            "phase_id": phase_id_from_status(data),
+            "status_data": data,
+            "raw": result,
+        }
+    )
+
+
+@app.post("/api/step-tool/step-control-test")
+def api_step_tool_step_control_test():
+    body = request.get_json(silent=True) or {}
+    try:
+        duration = int(body.get("duration", 30))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "步进控制时长必须是整数秒"}), 400
+    if not (1 <= duration <= 3600):
+        return jsonify({"ok": False, "message": "步进控制时长必须在 1 到 3600 秒之间"}), 400
+    try:
+        before_result = step_tool_request("/api/v1/tsc/status")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": f"获取当前控制状态失败：{exc}"}), 502
+    before_data = before_result.get("data") or {}
+    phase_id = phase_id_from_status(before_data)
+    if phase_id is None:
+        return jsonify({"ok": False, "message": "未从智能控制状态中找到可测试的 phaseID", "raw": before_result}), 502
+    try:
+        control_result = step_tool_request(
+            "/api/v1/tsc/stepControl",
+            method="POST",
+            payload={"phaseId": phase_id, "duration": duration},
+        )
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": f"步进控制指令发送失败：{exc}", "phase_id": phase_id}), 502
+    control_success = control_result.get("data") is not False
+    if not control_success:
+        return jsonify(
+            {
+                "ok": False,
+                "message": str(control_result.get("message") or "步进控制指令发送失败"),
+                "phase_id": phase_id,
+                "before": before_result,
+                "control": control_result,
+            }
+        ), 502
+    try:
+        after_result = step_tool_request("/api/v1/tsc/status")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": f"步进控制已发送，但刷新控制状态失败：{exc}", "phase_id": phase_id}), 502
+    after_data = after_result.get("data") or {}
+    ctrl_mode = after_data.get("ctrlMode")
+    try:
+        ctrl_mode_id = int(ctrl_mode)
+    except (TypeError, ValueError):
+        ctrl_mode_id = None
+    label = CTRL_MODE_LABELS.get(ctrl_mode_id, f"未知控制模式 {ctrl_mode_id}") if ctrl_mode_id is not None else "未知控制模式"
+    step_control = bool(after_data.get("stepControl")) or ctrl_mode_id == 10
+    message = f"已对 phaseID {phase_id} 发送 {duration} 秒步进控制，当前控制模式：{label}"
+    if step_control:
+        message = f"{message}，步进控制已生效"
+    else:
+        message = f"{message}，暂未确认进入步进控制"
+    return jsonify(
+        {
+            "ok": True,
+            "message": message,
+            "success": step_control,
+            "phase_id": phase_id,
+            "duration": duration,
+            "ctrl_mode": ctrl_mode_id,
+            "ctrl_mode_label": label,
+            "step_control": step_control,
+            "before": before_result,
+            "control": control_result,
+            "after": after_result,
+            "status_data": after_data,
+        }
+    )
+
+
+@app.post("/api/step-tool/step-control-cancel")
+def api_step_tool_step_control_cancel():
+    try:
+        cancel_result = step_tool_request("/api/v1/tsc/stepControl/cancel", method="POST")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": f"取消步进控制失败：{exc}"}), 502
+    success = cancel_result.get("data") is not False
+    if not success:
+        return jsonify({"ok": False, "message": str(cancel_result.get("message") or "取消步进控制失败"), "raw": cancel_result}), 502
+    try:
+        status_result = step_tool_request("/api/v1/tsc/status")
+    except RuntimeError:
+        status_result = None
+    status_data = (status_result or {}).get("data") or {}
+    return jsonify(
+        {
+            "ok": True,
+            "message": str(cancel_result.get("message") or "已取消步进控制"),
+            "success": True,
+            "raw": cancel_result,
+            "after": status_result,
+            "status_data": status_data,
+        }
+    )
+
+
+@app.post("/api/step-tool/tsc-config-upload")
+def api_step_tool_tsc_config_upload():
+    upload_file = request.files.get("file")
+    if upload_file is None:
+        return jsonify({"ok": False, "message": "请选择要上传的配置文件"}), 400
+    content = upload_file.read()
+    if not content:
+        return jsonify({"ok": False, "message": "配置文件内容为空"}), 400
+    try:
+        result = step_tool_upload(
+            "/api/v1/tsc/config/upload",
+            filename=upload_file.filename or "config.json",
+            content=content,
+            mimetype=upload_file.mimetype or "application/octet-stream",
+        )
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 502
+    data = result.get("data") or {}
+    filename = data.get("filename") or upload_file.filename or "配置文件"
+    size = data.get("size") or len(content)
+    return jsonify(
+        {
+            "ok": True,
+            "message": f"配置文件上传成功：{filename}（{size} 字节）",
+            "file": {"filename": filename, "size": size},
+            "raw": result,
         }
     )
 
