@@ -4,6 +4,26 @@ const navRoot = document.getElementById("sidebarNav");
 const htmlCache = new Map();
 const loadedPages = new Set();
 let activePageKey = panels.find((panel) => panel.classList.contains("active"))?.dataset.pageKey || "network";
+const CTRL_MODE_LABELS = {
+  0: "本地时段控制",
+  1: "关灯控制",
+  2: "黄闪控制",
+  3: "全红控制",
+  4: "定周期控制",
+  5: "协调绿波控制",
+  6: "协议红波控制",
+  7: "全感应控制",
+  8: "半感应控制",
+  9: "协调绿波全感应控制",
+  10: "步进控制",
+  12: "行人过街控制",
+  13: "单点自适应控制",
+  14: "静态干线控制",
+  15: "动态干线控制",
+  16: "区域优化控制",
+  17: "单点优化控制",
+  18: "公交优先控制",
+};
 
 
 function showToast(message, ok = true) {
@@ -85,7 +105,16 @@ async function activatePage(key) {
 
 function buildNavigation() {
   navRoot.innerHTML = "";
-  panels.forEach((panel, index) => {
+  const orderedPanels = panels.slice().sort((a, b) => {
+    if (a.dataset.pageKey === "data-check") {
+      return b.dataset.pageKey === "step-control" ? -1 : 1;
+    }
+    if (b.dataset.pageKey === "data-check") {
+      return a.dataset.pageKey === "step-control" ? 1 : -1;
+    }
+    return panels.indexOf(a) - panels.indexOf(b);
+  });
+  orderedPanels.forEach((panel, index) => {
     const button = document.createElement("button");
     button.className = `nav-item ${index === 0 ? "active" : ""}`;
     button.type = "button";
@@ -150,6 +179,7 @@ function renderCameraBindings(items) {
       <td data-check="stream"><span class="badge ${item.enable ? "warn" : "warn"}">${item.enable ? "未检查" : "已禁用"}</span></td>
       <td>
         <div class="row-actions">
+          <button class="btn secondary small camera-check-row-btn" type="button">检测</button>
           <button class="btn secondary small camera-disable-btn" type="button">禁用</button>
           <button class="btn secondary small danger camera-delete-btn" type="button">彻底删除</button>
         </div>
@@ -247,6 +277,10 @@ function bindCameraRow(row) {
     showToast(`source${row.dataset.index} 已标记为禁用，点击保存绑定后生效。`, true);
   });
 
+  row.querySelector(".camera-check-row-btn").addEventListener("click", async (event) => {
+    await checkCameraRows([row], event.currentTarget);
+  });
+
   row.querySelector(".camera-delete-btn").addEventListener("click", async () => {
     const sourceId = Number(row.dataset.index);
     if (row.dataset.isNew === "1") {
@@ -286,6 +320,91 @@ function collectCameraBindings() {
 }
 
 
+function collectCameraBindingsFromRows(rows) {
+  return rows.map((row) => ({
+    index: Number(row.dataset.index),
+    name: row.querySelector('[data-field="name"]').value.trim(),
+    enable: row.querySelector('[data-field="enable"]').value === "1",
+    host: row.querySelector('[data-field="host"]').value.trim(),
+    username: row.querySelector('[data-field="username"]').value.trim(),
+    password: row.querySelector('[data-field="password"]').value.trim(),
+    path: row.querySelector('[data-field="path"]').value.trim(),
+    port: Number(row.querySelector('[data-field="port"]')?.value.trim() || "554"),
+    uri: row.querySelector('[data-field="uri"]').value.trim(),
+  }));
+}
+
+
+async function checkCameraRows(rows, triggerButton = null) {
+  clearToast();
+  const checkedRows = rows.length ? rows : Array.from(document.querySelectorAll("#cameraTableBody tr"));
+  const checkButton = triggerButton || document.getElementById("checkCameraBtn");
+  const saveButton = document.getElementById("saveCameraBtn");
+  const reloadButton = document.getElementById("reloadCameraBtn");
+  const previousText = checkButton?.textContent || "";
+  if (checkButton) {
+    checkButton.disabled = true;
+    checkButton.textContent = "检查中...";
+  }
+  if (!triggerButton) {
+    saveButton.disabled = true;
+    reloadButton.disabled = true;
+  }
+  checkedRows.forEach((row) => {
+    const enabled = row.querySelector('[data-field="enable"]').value === "1";
+    const pingCell = row.querySelector('[data-check="ping"]');
+    const streamCell = row.querySelector('[data-check="stream"]');
+    if (!enabled) {
+      pingCell.innerHTML = '<span class="badge warn">已禁用</span>';
+      streamCell.innerHTML = '<span class="badge warn">已禁用</span>';
+      return;
+    }
+    pingCell.innerHTML = '<span class="badge warn">测试中</span>';
+    streamCell.innerHTML = '<span class="badge warn">测试中</span>';
+  });
+  showToast(triggerButton ? `正在检查 source${checkedRows[0]?.dataset.index}，请稍候...` : "正在检查相机连通性，请稍候...", true);
+  try {
+    const data = await fetchJson("/api/camera-bindings/check", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ items: collectCameraBindingsFromRows(checkedRows) }),
+    });
+    const resultMap = new Map((data.results || []).map((item) => [String(item.index), item]));
+    checkedRows.forEach((row) => {
+      const result = resultMap.get(row.dataset.index);
+      if (!result) {
+        return;
+      }
+      const pingCell = row.querySelector('[data-check="ping"]');
+      const streamCell = row.querySelector('[data-check="stream"]');
+      const ping = result.ping || {};
+      const stream = result.stream || {};
+      pingCell.innerHTML = `
+        <span class="badge ${ping.ok ? "ok" : "err"}">${ping.ok ? "可达" : "失败"}</span>
+        <div style="margin-top:6px;color:var(--muted);font-size:12px;">${ping.message || "-"}</div>
+      `;
+      streamCell.innerHTML = `
+        <span class="badge ${stream.ok ? "ok" : "err"}">${streamCheckLabel(stream)}</span>
+        <div style="margin-top:6px;color:var(--muted);font-size:12px;">${stream.message || "-"}</div>
+      `;
+    });
+    const hasFailure = (data.results || []).some((item) => !item.ok);
+    showToast(hasFailure ? "检查完成：有相机 Ping 或视频流拉流失败，请看表格红色结果。" : "检查完成：所选相机 Ping 和视频流拉流正常。", !hasFailure);
+  } catch (error) {
+    showToast(error.message, false);
+  } finally {
+    if (checkButton) {
+      checkButton.disabled = false;
+      checkButton.textContent = previousText;
+    }
+    if (!triggerButton) {
+      saveButton.disabled = false;
+      reloadButton.disabled = false;
+    }
+  }
+}
+
+
 function renderCalibration(items) {
   const root = document.getElementById("calibrationList");
   setHtmlIfChanged(root, items.map((item) => `
@@ -303,9 +422,22 @@ function renderServiceQuickActions(services) {
   const root = document.getElementById("serviceQuickActions");
   const html = services.map((item) => {
     const canChangeAutostart = !["static", "masked", "not-found"].includes(item.autostart || "");
+    const running = item.status === "active" || item.status === "running";
+    const autostartAction = item.autostart_enabled ? "disable" : "enable";
+    const autostartText = item.autostart_enabled ? "关闭开机自启" : "开启开机自启";
     return `
     <div class="status-card">
       <span class="label">${item.display_name || item.name}</span>
+      <div class="service-state-bar">
+        <div class="state-box ${running ? "active ok" : ""}">
+          <span class="state-symbol">✓</span>
+          <span>运行正常</span>
+        </div>
+        <div class="state-box ${running ? "" : "active err"}">
+          <span class="state-symbol">×</span>
+          <span>未运行</span>
+        </div>
+      </div>
       <div class="value">${statusBadge(item.status, item.status_label || item.status)}</div>
       <div class="value" style="margin-top:8px;">重启后自动启动：${statusBadge(item.autostart_enabled ? "ok" : "inactive", item.autostart_label || "未知")}</div>
       <div class="value" style="margin-top:8px; color: var(--muted); font-size: 13px;">系统服务：${item.name}</div>
@@ -314,8 +446,7 @@ function renderServiceQuickActions(services) {
         <button class="btn secondary service-start-btn" data-service="${item.name}" data-action="start">启动服务</button>
         <button class="btn secondary service-restart-btn" data-service="${item.name}" data-action="restart">重启服务</button>
         <button class="btn secondary service-stop-btn" data-service="${item.name}" data-action="stop">暂停服务</button>
-        <button class="btn secondary service-enable-btn" data-service="${item.name}" data-action="enable" ${(!canChangeAutostart || item.autostart_enabled) ? "disabled" : ""}>开启重启自动启动</button>
-        <button class="btn secondary service-disable-btn" data-service="${item.name}" data-action="disable" ${(!canChangeAutostart || !item.autostart_enabled) ? "disabled" : ""}>关闭重启自动启动</button>
+        <button class="btn secondary service-autostart-btn" data-service="${item.name}" data-action="${autostartAction}" ${!canChangeAutostart ? "disabled" : ""}>${autostartText}</button>
       </div>
     </div>
   `;
@@ -348,13 +479,9 @@ function renderServiceQuickActions(services) {
 function renderSignalStatus(signal, rootId = "signalStatus", syncInputs = true) {
   const root = document.getElementById(rootId);
   const hostInput = document.getElementById("signalHostInput");
-  const stepHostInput = document.getElementById("stepSignalHostInput");
   const portInput = document.getElementById("signalPortInput");
   if (syncInputs && hostInput && document.activeElement !== hostInput) {
     hostInput.value = signal.host || "";
-  }
-  if (syncInputs && stepHostInput && document.activeElement !== stepHostInput) {
-    stepHostInput.value = signal.host || "";
   }
   if (syncInputs && portInput && document.activeElement !== portInput) {
     portInput.value = signal.port || "";
@@ -368,7 +495,7 @@ function renderSignalStatus(signal, rootId = "signalStatus", syncInputs = true) 
 
 
 function syncSignalHostInputs(value, sourceId) {
-  ["signalHostInput", "stepSignalHostInput"].forEach((id) => {
+  ["signalHostInput"].forEach((id) => {
     const input = document.getElementById(id);
     if (!input || id === sourceId || document.activeElement === input) {
       return;
@@ -384,7 +511,7 @@ function updateStepDownloadSignalHost(value) {
   if (!root) {
     return;
   }
-  const host = (value || document.getElementById("stepSignalHostInput")?.value || document.getElementById("signalHostInput")?.value || "").trim();
+  const host = (value || document.getElementById("signalHostInput")?.value || "").trim();
   root.textContent = host || "-";
 }
 
@@ -394,9 +521,21 @@ function renderStepStatus(rootId, status, title, message) {
   if (!root) {
     return;
   }
+  const success = status === "ok" || status === "active" || status === "running";
+  const failed = status === "failed" || status === "err";
   setHtmlIfChanged(root, `
     <div class="summary-item">
       <span class="label">${title}</span>
+      <div class="service-state-bar">
+        <div class="state-box ${success ? "active ok" : ""}">
+          <span class="state-symbol">✓</span>
+          <span>成功</span>
+        </div>
+        <div class="state-box ${failed ? "active err" : ""}">
+          <span class="state-symbol">×</span>
+          <span>失败</span>
+        </div>
+      </div>
       <span class="value">${statusBadge(status, message)}</span>
     </div>
   `);
@@ -405,22 +544,37 @@ function renderStepStatus(rootId, status, title, message) {
 
 function renderStepControlPage() {
   const signalHost = document.getElementById("signalHostInput")?.value || window.BOX_ADMIN_BOOTSTRAP?.signalHost || "";
-  const stepHostInput = document.getElementById("stepSignalHostInput");
   const stepUsernameInput = document.getElementById("stepUsernameInput");
   const stepPortInput = document.getElementById("stepPortInput");
-  if (stepHostInput && document.activeElement !== stepHostInput) {
-    stepHostInput.value = signalHost;
-  }
   if (stepUsernameInput && !stepUsernameInput.value) {
     stepUsernameInput.value = "admin";
   }
   if (stepPortInput && !stepPortInput.value) {
-    stepPortInput.value = "80";
+    stepPortInput.value = "29999";
   }
-  updateStepDownloadSignalHost(stepHostInput?.value || signalHost);
-  renderStepStatus("stepToolStatus", "inactive", "步进工具", "尚未查询");
+  updateStepDownloadSignalHost(signalHost);
+  renderStepStatus("stepToolStatus", "inactive", "智能控制", "尚未查询");
+  renderStepStatus("stepServiceStatus", "inactive", "智能控制服务", "尚未查询");
   renderStepStatus("stepParamStatus", "inactive", "参数发送", "等待发送");
   renderStepStatus("stepSyncStatus", "inactive", "同步 / 上传", "尚未操作");
+  setPreplanRestartAvailable(true);
+}
+
+
+function setPreplanRestartAvailable(available) {
+  const button = document.getElementById("restartPreplanServiceBtn");
+  if (button) {
+    button.disabled = false;
+  }
+}
+
+
+function renderSignalControlOutput(data) {
+  const output = document.getElementById("signalControlStatusOutput");
+  const phaseText = data.phase_id ? `\n当前 phaseID：${data.phase_id}` : "";
+  const stepText = typeof data.step_control === "boolean" ? `\n步进控制：${data.step_control ? "已开启" : "未开启"}` : "";
+  output.classList.toggle("step-active", Boolean(data.step_control) || Number(data.ctrl_mode) === 10);
+  output.textContent = `控制模式：${data.ctrl_mode_label || "-"}（${data.ctrl_mode ?? "-"}）${stepText}${phaseText}`;
 }
 
 
@@ -449,11 +603,6 @@ function showStepPending(rootId, title) {
 }
 
 
-function metricMap(payload) {
-  return new Map((payload?.top || []).map((item) => [String(item.lane), item.value]));
-}
-
-
 function laneSortKey(lane) {
   const num = Number(lane);
   return Number.isFinite(num) ? num : String(lane);
@@ -461,11 +610,7 @@ function laneSortKey(lane) {
 
 
 function collectMetricLanes(metrics) {
-  const lanes = new Set();
-  ["flow", "headway", "queue"].forEach((key) => {
-    (metrics?.[key]?.top || []).forEach((item) => lanes.add(String(item.lane)));
-  });
-  return Array.from(lanes).sort((a, b) => {
+  return Array.from(metrics?.lanes || []).sort((a, b) => {
     const ak = laneSortKey(a);
     const bk = laneSortKey(b);
     if (typeof ak === "number" && typeof bk === "number") {
@@ -482,16 +627,15 @@ function renderLatestMetricTable(metrics) {
   const lanes = collectMetricLanes(metrics || {});
   if (!lanes.length) {
     setHtmlIfChanged(table, `<tbody><tr><td>暂无车道数据</td></tr></tbody>`);
-    meta.textContent = "未找到最新 CSV 数据。";
+    meta.textContent = "未找到最近 3 分钟车道数据。";
     return;
   }
-  const flow = metricMap(metrics.flow);
-  const headway = metricMap(metrics.headway);
-  const queue = metricMap(metrics.queue);
   const rows = [
-    { label: "最新车流", unit: "", values: flow },
-    { label: "车头时距", unit: " s", values: headway },
-    { label: "排队长度", unit: " m", values: queue },
+    { label: "3分钟总流量", unit: "", values: metrics.flow_total || {} },
+    { label: "3分钟平均车头时距", unit: " s", values: metrics.headway_avg || {} },
+    { label: "基础排队长度", unit: " m", values: metrics.base_queue || {} },
+    { label: "3分钟平均新增排队长度", unit: " m", values: metrics.queue_increment_avg || {} },
+    { label: "3分钟平均排队长度", unit: " m", values: metrics.queue_avg || {} },
   ];
   const html = `
     <thead>
@@ -504,14 +648,16 @@ function renderLatestMetricTable(metrics) {
       ${rows.map((row) => `
         <tr>
           <td>${row.label}</td>
-          ${lanes.map((lane) => `<td>${row.values.has(lane) ? `${row.values.get(lane)}${row.unit}` : "-"}</td>`).join("")}
+          ${lanes.map((lane) => `<td>${Object.prototype.hasOwnProperty.call(row.values, lane) ? `${row.values[lane]}${row.unit}` : "-"}</td>`).join("")}
         </tr>
       `).join("")}
     </tbody>
   `;
   setHtmlIfChanged(table, html);
-  const latestTimes = [metrics.flow?.updated_at, metrics.headway?.updated_at, metrics.queue?.updated_at].filter(Boolean);
-  meta.textContent = latestTimes.length ? `最近时间：${latestTimes[0]}` : "已读取最新车道数据。";
+  const rowsUsed = metrics.rows_used || {};
+  meta.textContent = metrics.updated_at
+    ? `统计最近 3 分钟车道数据，最近时间：${metrics.updated_at}。流量 ${rowsUsed.flow || 0} 条，车头时距 ${rowsUsed.headway || 0} 条，排队长度 ${rowsUsed.queue || 0} 条。`
+    : "已读取最近 3 分钟车道数据。";
 }
 
 
@@ -541,7 +687,7 @@ function renderHourlyFlowStats(flowWindow) {
     </tbody>
   `;
   setHtmlIfChanged(table, html);
-  meta.textContent = `统计最近 ${flowWindow.hours} 小时，使用 ${flowWindow.rows || 0} 条记录。`;
+  meta.textContent = `统计最近 ${flowWindow.minutes} 分钟，使用 ${flowWindow.rows || 0} 条记录。`;
 }
 
 
@@ -596,11 +742,11 @@ async function loadRuntimeSummary() {
 
 
 async function loadDataSummary() {
-  const hoursInput = document.getElementById("dataHoursInput");
-  const hours = hoursInput ? hoursInput.value.trim() || "1" : "1";
-  const data = await fetchJson(`/api/data-summary?hours=${encodeURIComponent(hours)}`);
+  const minutesInput = document.getElementById("dataMinutesInput");
+  const minutes = minutesInput ? minutesInput.value.trim() || "60" : "60";
+  const data = await fetchJson(`/api/data-summary?minutes=${encodeURIComponent(minutes)}`);
   const summary = data.summary || {};
-  renderLatestMetricTable(summary.metrics || {});
+  renderLatestMetricTable(summary.latest_metrics_3m || {});
   renderHourlyFlowStats(summary.flow_window || {});
   renderRecentEvents(summary.recent_events || []);
 }
@@ -616,9 +762,10 @@ async function loadPageData(key, force = false) {
     await loadCameraBindings();
   } else if (key === "calibration") {
     await loadCalibrationStatus();
-  } else if (key === "runtime" || key === "signal") {
+  } else if (key === "runtime") {
     await loadRuntimeSummary();
   } else if (key === "step-control") {
+    await loadRuntimeSummary();
     renderStepControlPage();
   } else if (key === "data-check") {
     if (force) {
@@ -700,64 +847,8 @@ function wireActions() {
   });
 
   document.getElementById("checkCameraBtn").addEventListener("click", async () => {
-    clearToast();
-    const checkButton = document.getElementById("checkCameraBtn");
-    const saveButton = document.getElementById("saveCameraBtn");
-    const reloadButton = document.getElementById("reloadCameraBtn");
-    const previousText = checkButton.textContent;
     const rows = Array.from(document.querySelectorAll("#cameraTableBody tr"));
-    checkButton.disabled = true;
-    saveButton.disabled = true;
-    reloadButton.disabled = true;
-    checkButton.textContent = "检查中...";
-    rows.forEach((row) => {
-      const enabled = row.querySelector('[data-field="enable"]').value === "1";
-      const pingCell = row.querySelector('[data-check="ping"]');
-      const streamCell = row.querySelector('[data-check="stream"]');
-      if (!enabled) {
-        pingCell.innerHTML = '<span class="badge warn">已禁用</span>';
-        streamCell.innerHTML = '<span class="badge warn">已禁用</span>';
-        return;
-      }
-      pingCell.innerHTML = '<span class="badge warn">检查中</span><div style="margin-top:6px;color:var(--muted);font-size:12px;">正在 Ping 相机 IP...</div>';
-      streamCell.innerHTML = '<span class="badge warn">检查中</span><div style="margin-top:6px;color:var(--muted);font-size:12px;">正在验证视频流，可能需要十几秒...</div>';
-    });
-    showToast("正在检查相机连通性，请稍候...", true);
-    try {
-      const data = await fetchJson("/api/camera-bindings/check", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ items: collectCameraBindings() }),
-      });
-      const resultMap = new Map((data.results || []).map((item) => [String(item.index), item]));
-      Array.from(document.querySelectorAll("#cameraTableBody tr")).forEach((row) => {
-        const result = resultMap.get(row.dataset.index);
-        if (!result) {
-          return;
-        }
-        const pingCell = row.querySelector('[data-check="ping"]');
-        const streamCell = row.querySelector('[data-check="stream"]');
-        const ping = result.ping || {};
-        const stream = result.stream || {};
-        pingCell.innerHTML = `
-          <span class="badge ${ping.ok ? "ok" : "err"}">${ping.ok ? "可达" : "失败"}</span>
-          <div style="margin-top:6px;color:var(--muted);font-size:12px;">${ping.message || "-"}</div>
-        `;
-        streamCell.innerHTML = `
-          <span class="badge ${stream.ok ? "ok" : "err"}">${streamCheckLabel(stream)}</span>
-          <div style="margin-top:6px;color:var(--muted);font-size:12px;">${stream.message || "-"}</div>
-        `;
-      });
-      const hasFailure = (data.results || []).some((item) => !item.ok);
-      showToast(hasFailure ? "检查完成：有相机 Ping 或视频流拉流失败，请看表格红色结果。" : "检查完成：所有启用相机 Ping 和视频流拉流正常。", !hasFailure);
-    } catch (error) {
-      showToast(error.message, false);
-    } finally {
-      checkButton.disabled = false;
-      saveButton.disabled = false;
-      reloadButton.disabled = false;
-      checkButton.textContent = previousText;
-    }
+    await checkCameraRows(rows);
   });
 
   document.getElementById("iface").addEventListener("change", async (event) => {
@@ -780,7 +871,7 @@ function wireActions() {
     }
   });
 
-  ["signalHostInput", "stepSignalHostInput"].forEach((id) => {
+  ["signalHostInput"].forEach((id) => {
     const input = document.getElementById(id);
     if (!input) {
       return;
@@ -804,7 +895,7 @@ function wireActions() {
       });
       renderSignalStatus(data.signal_controller || {}, "signalStatus", false);
       loadedPages.delete("runtime");
-      loadedPages.delete("signal");
+      loadedPages.delete("step-control");
       showToast(data.message, data.signal_controller?.ping?.ok && data.signal_controller?.tcp?.ok);
     } catch (error) {
       showToast(error.message, false);
@@ -813,38 +904,51 @@ function wireActions() {
 
   document.getElementById("checkStepToolBtn").addEventListener("click", async () => {
     clearToast();
+    setPreplanRestartAvailable(true);
     try {
       const data = await fetchJson("/api/step-tool/status");
-      renderStepStatus("stepToolStatus", data.online ? "ok" : "failed", "步进工具", data.message);
+      renderStepStatus("stepToolStatus", data.online ? "ok" : "failed", "智能控制", data.message);
+      setPreplanRestartAvailable(true);
       showToast(data.message, data.online);
     } catch (error) {
-      renderStepStatus("stepToolStatus", "failed", "步进工具", error.message);
+      renderStepStatus("stepToolStatus", "failed", "智能控制", error.message);
+      setPreplanRestartAvailable(true);
       showToast(error.message, false);
     }
   });
 
-  document.getElementById("fetchStepParamsBtn").addEventListener("click", async () => {
+  document.getElementById("restartPreplanServiceBtn").addEventListener("click", async () => {
     clearToast();
+    const button = document.getElementById("restartPreplanServiceBtn");
+    const previousText = button.textContent;
+    button.disabled = true;
+    button.textContent = "重启中...";
     try {
-      const data = await fetchJson("/api/step-tool/tsc-config");
-      const config = data.config || {};
-      document.getElementById("stepSignalHostInput").value = config.ip || "";
-      document.getElementById("stepUsernameInput").value = config.username || "";
-      document.getElementById("stepPasswordInput").value = config.password || "";
-      document.getElementById("stepPortInput").value = config.port || "";
-      syncSignalHostInputs(config.ip || "", "stepSignalHostInput");
-      updateStepDownloadSignalHost(config.ip || "");
-      renderStepStatus("stepParamStatus", "ok", "参数读取", data.message || "当前参数读取成功");
-      showToast(data.message || "当前参数读取成功", true);
+      renderStepStatus("stepToolStatus", "warning", "智能控制", "正在重启智能控制服务...");
+      const data = await fetchJson("/api/step-tool/restart-service", { method: "POST" });
+      renderStepStatus("stepToolStatus", "ok", "智能控制", data.message);
+      showToast(data.message, true);
     } catch (error) {
-      renderStepStatus("stepParamStatus", "failed", "参数读取", error.message);
+      renderStepStatus("stepToolStatus", "failed", "智能控制", error.message);
+      setPreplanRestartAvailable(true);
       showToast(error.message, false);
+    } finally {
+      button.textContent = previousText;
     }
+  });
+
+  document.getElementById("openStepToolPageBtn").addEventListener("click", () => {
+    clearToast();
+    const host = window.location.hostname || "127.0.0.1";
+    const url = `http://${host}:8080/`;
+    window.open(url, "_blank", "noopener,noreferrer");
+    renderStepStatus("stepServiceStatus", "ok", "智能控制页面", `已打开 ${url}`);
+    showToast("已打开智能控制页面", true);
   });
 
   document.getElementById("sendStepParamsBtn").addEventListener("click", async () => {
     clearToast();
-    const host = document.getElementById("stepSignalHostInput").value.trim();
+    const host = document.getElementById("signalHostInput").value.trim();
     const username = document.getElementById("stepUsernameInput").value.trim();
     const password = document.getElementById("stepPasswordInput").value;
     const port = document.getElementById("stepPortInput").value.trim();
@@ -859,10 +963,11 @@ function wireActions() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ ip: host, username, password, port }),
       });
-      renderStepStatus("stepParamStatus", data.success ? "ok" : "failed", "参数发送", data.message);
+      const testMessage = data.connection_test ? "已自动完成信号机登录测试。" : "";
+      renderStepStatus("stepParamStatus", data.success ? "ok" : "failed", "参数发送 / 登录测试", `${data.message}${testMessage ? ` ${testMessage}` : ""}`);
       showToast(data.message, data.success);
     } catch (error) {
-      renderStepStatus("stepParamStatus", "failed", "参数发送", error.message);
+      renderStepStatus("stepParamStatus", "failed", "参数发送 / 登录测试", error.message);
       showToast(error.message, false);
     }
   });
@@ -871,11 +976,66 @@ function wireActions() {
     clearToast();
     try {
       const data = await fetchJson("/api/step-tool/tsc-status");
-      document.getElementById("signalControlStatusOutput").textContent = `控制模式：${data.ctrl_mode_label}（${data.ctrl_mode}）`;
+      renderSignalControlOutput(data);
       showToast(data.message, true);
     } catch (error) {
       document.getElementById("signalControlStatusOutput").textContent = error.message;
       showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("testStepControlBtn").addEventListener("click", async () => {
+    clearToast();
+    const button = document.getElementById("testStepControlBtn");
+    const previousText = button.textContent;
+    button.disabled = true;
+    button.textContent = "测试中...";
+    const duration = document.getElementById("stepDurationInput").value.trim() || "30";
+    try {
+      renderStepStatus("stepServiceStatus", "warning", "步进控制测试", `正在发送 ${duration} 秒步进控制并刷新控制状态...`);
+      const data = await fetchJson("/api/step-tool/step-control-test", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ duration }),
+      });
+      renderSignalControlOutput(data);
+      renderStepStatus("stepServiceStatus", data.success ? "ok" : "warning", "步进控制测试", data.message);
+      showToast(data.message, data.success);
+    } catch (error) {
+      renderStepStatus("stepServiceStatus", "failed", "步进控制测试", error.message);
+      showToast(error.message, false);
+    } finally {
+      button.disabled = false;
+      button.textContent = previousText;
+    }
+  });
+
+  document.getElementById("cancelStepControlBtn").addEventListener("click", async () => {
+    clearToast();
+    const button = document.getElementById("cancelStepControlBtn");
+    const previousText = button.textContent;
+    button.disabled = true;
+    button.textContent = "取消中...";
+    try {
+      const data = await fetchJson("/api/step-tool/step-control-cancel", { method: "POST" });
+      if (data.after?.data) {
+        const statusData = data.after.data || {};
+        const ctrlMode = Number(statusData.ctrlMode);
+        renderSignalControlOutput({
+          ctrl_mode: Number.isFinite(ctrlMode) ? ctrlMode : statusData.ctrlMode,
+          ctrl_mode_label: Number.isFinite(ctrlMode) ? (CTRL_MODE_LABELS?.[ctrlMode] || `未知控制模式 ${ctrlMode}`) : "-",
+          step_control: Boolean(statusData.stepControl),
+          phase_id: data.phase_id,
+        });
+      }
+      renderStepStatus("stepServiceStatus", "ok", "取消步进控制", data.message);
+      showToast(data.message, true);
+    } catch (error) {
+      renderStepStatus("stepServiceStatus", "failed", "取消步进控制", error.message);
+      showToast(error.message, false);
+    } finally {
+      button.disabled = false;
+      button.textContent = previousText;
     }
   });
 
@@ -886,7 +1046,7 @@ function wireActions() {
 
   document.getElementById("openSignalConfigPageBtn").addEventListener("click", () => {
     clearToast();
-    const host = document.getElementById("stepSignalHostInput").value.trim() || document.getElementById("signalHostInput").value.trim();
+    const host = document.getElementById("signalHostInput").value.trim();
     if (!host) {
       renderStepStatus("stepSyncStatus", "failed", "配置下载", "请先填写或读取信号机 IP");
       showToast("请先填写或读取信号机 IP", false);
@@ -944,10 +1104,10 @@ function wireActions() {
       renderSignalStatus(data.signal_controller || {}, "signalStatus", true);
       showToast(data.message, true);
       loadedPages.delete("runtime");
-      loadedPages.delete("signal");
+      loadedPages.delete("step-control");
       await loadRuntimeSummary();
       loadedPages.add("runtime");
-      loadedPages.add("signal");
+      loadedPages.add("step-control");
     } catch (error) {
       showToast(error.message, false);
     }

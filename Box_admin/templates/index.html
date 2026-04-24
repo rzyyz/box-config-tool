@@ -146,14 +146,14 @@
           </article>
         </section>
 
-        <section class="page-panel" data-page-key="signal" data-page-title="信号机设置">
+        <section class="page-panel" data-page-key="step-control" data-page-title="信号机与智能控制平台连通状态">
           <div class="section-head">
-            <h2>信号机设置</h2>
-            <p>配置路口信号机的 IP 和端口，并可立即检查 IP 是否能 Ping 通、端口是否能连接。</p>
+            <h2>信号机与智能控制平台连通状态</h2>
+            <p>先确认信号机地址，再按现场操作顺序检查智能控制平台、发送参数、查看控制状态、完成配置文件同步上传。</p>
           </div>
           <div class="card-grid two">
             <article class="card">
-              <h3>目标地址</h3>
+              <div class="step-title"><span>1</span><h3>信号机与智能控制平台参数</h3></div>
               <p class="subtle">保存后会写入识别程序配置，并自动重启路口感知检测服务。</p>
               <div class="field-grid">
                 <label class="field">
@@ -167,8 +167,26 @@
               </div>
               <div class="actions">
                 <button id="checkSignalBtn" class="btn secondary">立即 Ping / 检查端口</button>
-                <button id="saveSignalBtn" class="btn primary">保存并自动重启</button>
+                <button id="saveSignalBtn" class="btn primary">保存配置并将IP同步到车辆检测服务</button>
               </div>
+              <div class="field-grid smart-platform-fields">
+                <label class="field">
+                  <span>智能控制平台端口</span>
+                  <input id="stepPortInput" placeholder="例如 29999">
+                </label>
+                <label class="field">
+                  <span>智能控制平台账户</span>
+                  <input id="stepUsernameInput" placeholder="例如 admin">
+                </label>
+                <label class="field">
+                  <span>智能控制平台密码</span>
+                  <input id="stepPasswordInput" placeholder="请输入密码">
+                </label>
+              </div>
+              <div class="actions">
+                <button id="sendStepParamsBtn" class="btn primary">同步参数到智能控制平台</button>
+              </div>
+              <div id="stepParamStatus" class="summary-list"></div>
             </article>
             <article class="card">
               <h3>信号机心跳检测</h3>
@@ -176,60 +194,28 @@
               <div id="signalStatus" class="summary-list"></div>
             </article>
           </div>
-        </section>
-
-        <section class="page-panel" data-page-key="step-control" data-page-title="步进控制状态">
-          <div class="section-head">
-            <h2>步进控制状态</h2>
-            <p>按现场操作顺序依次检查步进工具、发送信号机参数、查看控制状态，并完成配置文件同步上传。</p>
-          </div>
           <div class="step-flow">
             <article class="card step-card">
-              <div class="step-title"><span>1</span><h3>检查步进工具状态</h3></div>
-              <p class="subtle">检查本机步进工具服务是否在线，便于确认后续参数发送和同步操作是否可用。</p>
+              <div class="step-title"><span>2</span><h3>检查智能控制程序状态</h3></div>
+              <p class="subtle">检查本机智能控制程序是否在线，便于确认后续参数发送和同步操作是否可用。</p>
               <div class="actions">
-                <button id="checkStepToolBtn" class="btn secondary">查询步进工具状态</button>
+                <button id="checkStepToolBtn" class="btn secondary">查询智能控制状态</button>
+                <button id="restartPreplanServiceBtn" class="btn secondary danger">重启智能控制服务</button>
               </div>
               <div id="stepToolStatus" class="summary-list"></div>
             </article>
-            <article class="card step-card">
-              <div class="step-title"><span>2</span><h3>信号机连接参数</h3></div>
-              <p class="subtle">信号机 IP 会与“信号机设置”页面保持一致，任一页面修改后另一页同步更新。</p>
-              <div class="field-grid">
-                <label class="field">
-                  <span>信号机 IP</span>
-                  <input id="stepSignalHostInput" placeholder="例如 172.16.4.246">
-                </label>
-                <label class="field">
-                  <span>账户</span>
-                  <input id="stepUsernameInput" placeholder="例如 admin">
-                </label>
-                <label class="field">
-                  <span>密码</span>
-                  <input id="stepPasswordInput" placeholder="请输入密码">
-                </label>
-                <label class="field">
-                  <span>端口号</span>
-                  <input id="stepPortInput" placeholder="例如 80">
-                </label>
-              </div>
+            <div class="step-compact-grid">
+            <article class="card step-card compact">
+              <div class="step-title"><span>3</span><h3>信号机当前控制状态</h3></div>
+              <p class="subtle">获取智能控制返回的信号机当前控制状态，便于现场确认当前控制链路。</p>
               <div class="actions">
-                <button id="fetchStepParamsBtn" class="btn secondary">读取当前参数</button>
-                <button id="sendStepParamsBtn" class="btn primary">发送参数</button>
-              </div>
-              <div id="stepParamStatus" class="summary-list"></div>
-            </article>
-            <article class="card step-card">
-              <div class="step-title"><span>3</span><h3>信号机控制状态</h3></div>
-              <p class="subtle">获取步进工具返回的信号机控制状态，便于现场确认当前控制链路。</p>
-              <div class="actions">
-                <button id="fetchSignalControlStatusBtn" class="btn secondary">获取信号机控制状态</button>
+                <button id="fetchSignalControlStatusBtn" class="btn secondary">获取当前控制状态</button>
               </div>
               <pre id="signalControlStatusOutput" class="log-box">尚未获取。</pre>
             </article>
-            <article class="card step-card">
+            <article class="card step-card compact">
               <div class="step-title"><span>4</span><h3>配置同步上传</h3></div>
-              <p class="subtle">先打开当前信号机页面，由操作人员手动下载配置文件；上传时请选择下载好的配置文件，系统会发送给步进工具。</p>
+              <p class="subtle">先打开当前信号机页面，由操作人员手动下载配置文件；上传时请选择下载好的配置文件，系统会发送给智能控制。</p>
               <div class="summary-list">
                 <div class="summary-item">
                   <span class="label">当前信号机 IP</span>
@@ -244,6 +230,21 @@
               </div>
               <div id="stepSyncStatus" class="summary-list"></div>
             </article>
+            <article class="card step-card compact">
+              <div class="step-title"><span>5</span><h3>步进控制服务</h3></div>
+              <p class="subtle">选择步进控制时长后，可测试是否能进入步进控制，也可取消步进控制。</p>
+              <label class="field">
+                <span>步进控制时长（秒）</span>
+                <input id="stepDurationInput" type="number" min="1" step="1" value="30">
+              </label>
+              <div class="actions">
+                <button id="testStepControlBtn" class="btn secondary">测试步进控制</button>
+                <button id="cancelStepControlBtn" class="btn secondary">取消步进控制</button>
+                <button id="openStepToolPageBtn" class="btn primary">打开智能控制页面</button>
+              </div>
+              <div id="stepServiceStatus" class="summary-list"></div>
+            </article>
+            </div>
           </div>
         </section>
 
@@ -258,15 +259,15 @@
               <div class="actions">
                 <label class="inline-field">
                   <span>统计最近</span>
-                  <input id="dataHoursInput" type="number" min="0.1" max="24" step="0.5" value="1">
-                  <span>小时</span>
+                  <input id="dataMinutesInput" type="number" min="1" max="1440" step="1" value="60">
+                  <span>分钟</span>
                 </label>
                 <button id="refreshDataBtn" class="btn primary">刷新数据检测</button>
               </div>
             </div>
           </article>
           <article class="card">
-            <h3>最新车道数据</h3>
+            <h3>最近三分钟车道数据</h3>
             <div id="latestMetricMeta" class="subtle">尚未刷新。</div>
             <div class="table-wrap">
               <table id="latestMetricTable" class="data-table compact-table"></table>
@@ -274,7 +275,7 @@
           </article>
           <article class="card">
             <h3>最近时段流量统计</h3>
-            <div id="hourlyFlowMeta" class="subtle">默认统计最近 1 小时，可修改后刷新。</div>
+            <div id="hourlyFlowMeta" class="subtle">默认统计最近 60 分钟，可修改后刷新。</div>
             <div class="table-wrap">
               <table id="hourlyFlowTable" class="data-table compact-table"></table>
             </div>

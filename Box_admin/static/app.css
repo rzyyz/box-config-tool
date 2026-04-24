@@ -210,8 +210,18 @@ html, body {
   gap: 18px;
 }
 
+.step-compact-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+
 .step-card {
   border-left: 4px solid rgba(245, 158, 11, 0.72);
+}
+
+.step-card.compact {
+  padding: 16px;
 }
 
 .step-title {
@@ -242,6 +252,24 @@ html, body {
 
 .step-title h3 {
   margin: 0;
+}
+
+.step-card.compact .subtle {
+  min-height: 42px;
+}
+
+.step-card.compact .actions {
+  margin-top: 10px;
+}
+
+.step-card.compact .summary-item {
+  padding: 12px;
+}
+
+.step-card.compact .log-box {
+  min-height: 86px;
+  max-height: 132px;
+  overflow: auto;
 }
 
 .summary-list,
@@ -276,10 +304,56 @@ html, body {
   line-height: 1.5;
 }
 
+.service-state-bar {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin: 10px 0 12px;
+}
+
+.state-box {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 42px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+  background: rgba(8, 16, 31, 0.48);
+  font-size: 13px;
+}
+
+.state-box.active.ok {
+  border-color: rgba(34, 197, 94, 0.72);
+  color: #dcfce7;
+  background: rgba(34, 197, 94, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.12);
+}
+
+.state-box.active.err {
+  border-color: rgba(239, 68, 68, 0.72);
+  color: #fee2e2;
+  background: rgba(239, 68, 68, 0.16);
+  box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.12);
+}
+
+.state-symbol {
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+}
+
 .field-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 14px;
+}
+
+.smart-platform-fields {
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line);
 }
 
 .field.full {
@@ -512,6 +586,12 @@ input:focus, select:focus {
   min-height: 120px;
 }
 
+.log-box.step-active {
+  border-color: rgba(34, 197, 94, 0.78);
+  background: rgba(20, 83, 45, 0.34);
+  box-shadow: 0 0 0 1px rgba(34, 197, 94, 0.18), 0 16px 36px rgba(34, 197, 94, 0.12);
+}
+
 .toast {
   display: none;
   margin-bottom: 16px;
@@ -546,7 +626,8 @@ input:focus, select:focus {
 
   .card-grid.two,
   .card-grid.three,
-  .field-grid {
+  .field-grid,
+  .step-compact-grid {
     grid-template-columns: 1fr;
   }
 }

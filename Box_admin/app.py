@@ -640,6 +640,21 @@ def classify_rtsp_error(message: str) -> tuple[str, str]:
     return "stream_failed", "视频流拉流失败，请检查账号、密码、路径和相机状态"
 
 
+def gst_output_confirms_stream(message: str) -> bool:
+    text = (message or "").lower()
+    success_markers = [
+        "setting pipeline to playing",
+        "new clock",
+        "stream-start",
+        "gstmessage-stream-start",
+        "async-done",
+        "pipeline is live and does not need preroll",
+        "pipeline is prerolled",
+        "redistribute latency",
+    ]
+    return any(marker in text for marker in success_markers)
+
+
 def check_rtsp_stream(uri: str, timeout: int = 8) -> dict[str, Any]:
     if not uri:
         return {"ok": False, "reason": "empty_uri", "message": "RTSP 地址为空"}
@@ -647,13 +662,21 @@ def check_rtsp_stream(uri: str, timeout: int = 8) -> dict[str, Any]:
     if parsed.scheme.lower() != "rtsp" or not parsed.hostname:
         return {"ok": False, "reason": "invalid_uri", "message": "RTSP 地址格式无效"}
 
+    tcp_result = tcp_check(parsed.hostname, parsed.port or 554, timeout_sec=2.0)
+    if not tcp_result["ok"]:
+        return {
+            "ok": False,
+            "reason": "connect_failed",
+            "message": f"RTSP 端口不可达：{tcp_result['message']}",
+        }
+
     gst_launch = shutil.which("gst-launch-1.0")
     if not gst_launch:
         return {"ok": False, "reason": "missing_tool", "message": "缺少 gst-launch-1.0，无法按 DeepStream/GStreamer 链路验证拉流"}
 
     cmd = [
         gst_launch,
-        "-q",
+        "-m",
         "rtspsrc",
         f"location={uri}",
         "protocols=tcp",
@@ -667,11 +690,29 @@ def check_rtsp_stream(uri: str, timeout: int = 8) -> dict[str, Any]:
     ]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        return {"ok": True, "reason": "stream_ok", "message": "GStreamer 已持续接收视频流"}
-    if result.returncode == 0:
+        raw_output = (result.stderr or "") + "\n" + (result.stdout or "")
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        raw_output = f"{stderr}\n{stdout}"
+        if gst_output_confirms_stream(raw_output):
+            return {"ok": True, "reason": "stream_ok", "message": "GStreamer 已进入播放状态，视频流可用"}
+        raw_message = sanitize_rtsp_error_message(raw_output.strip() or "GStreamer 未确认收到视频流", uri)
+        detail = raw_message[:200]
+        message = "视频流拉流超时，未确认进入播放或收到视频流"
+        if detail:
+            message = f"{message}；详情：{detail}"
+        return {"ok": False, "reason": "timeout", "message": message[:260]}
+    if result.returncode == 0 and gst_output_confirms_stream(raw_output):
         return {"ok": True, "reason": "stream_ok", "message": "GStreamer 拉流正常"}
-    raw_message = sanitize_rtsp_error_message((result.stderr or result.stdout or "GStreamer 拉流失败").strip(), uri)
+    if result.returncode == 0:
+        raw_message = sanitize_rtsp_error_message(raw_output.strip() or "GStreamer 未确认收到视频流", uri)
+        detail = raw_message[:200]
+        message = "GStreamer 退出但未确认进入播放或收到视频流"
+        if detail:
+            message = f"{message}；详情：{detail}"
+        return {"ok": False, "reason": "no_video", "message": message[:260]}
+    raw_message = sanitize_rtsp_error_message((raw_output or "GStreamer 拉流失败").strip(), uri)
     reason, friendly_message = classify_rtsp_error(raw_message)
     detail = raw_message[:200]
     if detail and detail != friendly_message:
@@ -726,24 +767,24 @@ def step_tool_csrf_opener() -> tuple[urlrequest.OpenerDirector, str]:
         with opener.open(login_url, timeout=STEP_TOOL_TIMEOUT) as response:
             html = response.read().decode("utf-8", errors="replace")
     except Exception as exc:
-        raise RuntimeError(f"无法获取步进工具安全令牌：{exc}") from exc
+        raise RuntimeError(f"无法获取智能控制安全令牌：{exc}") from exc
     match = re.search(r'name=["\']_csrf["\'][^>]*value=["\']([^"\']+)["\']', html)
     if not match:
         match = re.search(r'value=["\']([^"\']+)["\'][^>]*name=["\']_csrf["\']', html)
     if not match:
-        raise RuntimeError("步进工具未返回安全令牌，请确认服务登录页是否正常")
+        raise RuntimeError("智能控制未返回安全令牌，请确认服务登录页是否正常")
     return opener, match.group(1)
 
 
 def step_tool_decode_json(raw: str, final_url: str) -> dict[str, Any]:
     if final_url.rstrip("/").endswith("/login"):
-        raise RuntimeError("步进工具要求安全令牌或登录态，当前请求被重定向到登录页")
+        raise RuntimeError("智能控制要求安全令牌或登录态，当前请求被重定向到登录页")
     try:
         result = json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise RuntimeError("步进工具返回内容不是有效 JSON") from exc
+        raise RuntimeError("智能控制返回内容不是有效 JSON") from exc
     if result.get("code") != 200:
-        raise RuntimeError(str(result.get("message") or "步进工具接口返回失败"))
+        raise RuntimeError(str(result.get("message") or "智能控制接口返回失败"))
     return result
 
 
@@ -764,9 +805,9 @@ def step_tool_request(path: str, method: str = "GET", payload: dict[str, Any] | 
             raw = response.read().decode("utf-8")
             final_url = response.geturl()
     except urlerror.URLError as exc:
-        raise RuntimeError(f"无法连接步进工具服务：{exc}") from exc
+        raise RuntimeError(f"无法连接智能控制服务：{exc}") from exc
     except TimeoutError as exc:
-        raise RuntimeError("连接步进工具服务超时") from exc
+        raise RuntimeError("连接智能控制服务超时") from exc
     return step_tool_decode_json(raw, final_url)
 
 
@@ -802,9 +843,9 @@ def step_tool_upload(path: str, filename: str, content: bytes, mimetype: str) ->
             raw = response.read().decode("utf-8")
             final_url = response.geturl()
     except urlerror.URLError as exc:
-        raise RuntimeError(f"无法连接步进工具服务：{exc}") from exc
+        raise RuntimeError(f"无法连接智能控制服务：{exc}") from exc
     except TimeoutError as exc:
-        raise RuntimeError("连接步进工具服务超时") from exc
+        raise RuntimeError("连接智能控制服务超时") from exc
     return step_tool_decode_json(raw, final_url)
 
 
@@ -994,16 +1035,155 @@ def read_latest_csv_summary(prefix: str) -> dict[str, Any]:
     }
 
 
-def read_flow_window_summary(hours: float) -> dict[str, Any]:
-    safe_hours = max(0.1, min(float(hours or 1), 24.0))
-    path = latest_csv_file("flow")
+def load_base_length_summary() -> dict[str, float]:
+    path = CALIBRATION_FILES.get("base_length")
+    if not path or not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, float] = {}
+    for key, value in payload.items():
+        try:
+            result[str(key)] = round(float(value), 2)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def read_metric_window(prefix: str, minutes: int, mode: str) -> dict[str, Any]:
+    safe_minutes = max(1, min(int(minutes or 3), 1440))
+    path = latest_csv_file(prefix)
     if path is None:
-        return {"file": None, "hours": safe_hours, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
-    max_lines = min(max(int(safe_hours * 3700) + 30, 400), 100000)
+        return {"file": None, "minutes": safe_minutes, "lanes": [], "by_lane": {}, "rows": 0, "updated_at": None}
+    max_lines = min(max(int(safe_minutes * 65) + 30, 400), 100000)
     try:
         header, data_lines = read_csv_tail_rows(path, max_lines=max_lines)
         if not data_lines:
-            return {"file": str(path), "hours": safe_hours, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
+            return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "rows": 0, "updated_at": None}
+        reader = csv.DictReader(StringIO(header + "\n" + "\n".join(data_lines) + "\n"))
+        rows = list(reader)
+        latest_ts = None
+        latest_dt = None
+        for row in reversed(rows):
+            try:
+                latest_ts = float(row.get("ts", ""))
+                latest_dt = row.get("dateTime")
+                break
+            except (TypeError, ValueError):
+                continue
+        if latest_ts is None:
+            return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "rows": 0, "updated_at": None}
+        start_ts = latest_ts - safe_minutes * 60
+        sums: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        used_rows = 0
+        for row in rows:
+            try:
+                row_ts = float(row.get("ts", ""))
+            except (TypeError, ValueError):
+                continue
+            if row_ts < start_ts:
+                continue
+            used_rows += 1
+            for key, value in row.items():
+                if not key.startswith("lane_"):
+                    continue
+                lane = key.replace("lane_", "")
+                try:
+                    num = float(value or 0)
+                except (TypeError, ValueError):
+                    continue
+                if mode == "sum":
+                    sums[lane] = sums.get(lane, 0.0) + num
+                    counts[lane] = counts.get(lane, 0) + 1
+                elif mode == "avg_positive":
+                    if num > 0:
+                        sums[lane] = sums.get(lane, 0.0) + num
+                        counts[lane] = counts.get(lane, 0) + 1
+                else:
+                    sums[lane] = sums.get(lane, 0.0) + num
+                    counts[lane] = counts.get(lane, 0) + 1
+
+        def lane_sort_key(lane: str) -> tuple[int, Any]:
+            return (0, int(lane)) if lane.isdigit() else (1, lane)
+
+        lanes = sorted(set(sums.keys()) | set(counts.keys()), key=lane_sort_key)
+        by_lane: dict[str, float] = {}
+        for lane in lanes:
+            if mode == "sum":
+                by_lane[lane] = round(sums.get(lane, 0.0), 2)
+            else:
+                count = counts.get(lane, 0)
+                by_lane[lane] = round((sums.get(lane, 0.0) / count) if count > 0 else 0.0, 2)
+        return {
+            "file": str(path),
+            "minutes": safe_minutes,
+            "lanes": lanes,
+            "by_lane": by_lane,
+            "rows": used_rows,
+            "updated_at": latest_dt,
+        }
+    except Exception as exc:
+        return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "rows": 0, "updated_at": None, "error": str(exc)}
+
+
+def read_recent_lane_metrics_summary(minutes: int = 3) -> dict[str, Any]:
+    safe_minutes = max(1, min(int(minutes or 3), 1440))
+    flow = read_metric_window("flow", safe_minutes, mode="sum")
+    headway = read_metric_window("headway", safe_minutes, mode="avg_positive")
+    queue = read_metric_window("queueLen", safe_minutes, mode="avg")
+    base_lengths = load_base_length_summary()
+
+    def lane_sort_key(lane: str) -> tuple[int, Any]:
+        return (0, int(lane)) if lane.isdigit() else (1, lane)
+
+    lanes = sorted(
+        set(flow.get("lanes", [])) | set(headway.get("lanes", [])) | set(queue.get("lanes", [])) | set(base_lengths.keys()),
+        key=lane_sort_key,
+    )
+    flow_by_lane = {lane: round(float(flow.get("by_lane", {}).get(lane, 0.0)), 2) for lane in lanes}
+    headway_by_lane = {lane: round(float(headway.get("by_lane", {}).get(lane, 0.0)), 2) for lane in lanes}
+    base_by_lane = {lane: round(float(base_lengths.get(lane, 0.0)), 2) for lane in lanes}
+    queue_avg_by_lane: dict[str, float] = {}
+    queue_increment_by_lane: dict[str, float] = {}
+    for lane in lanes:
+        base_val = base_by_lane[lane]
+        measured_avg = round(float(queue.get("by_lane", {}).get(lane, 0.0)), 2)
+        increment_avg = round(max(measured_avg - base_val, 0.0), 2)
+        queue_increment_by_lane[lane] = increment_avg
+        queue_avg_by_lane[lane] = round(base_val + increment_avg, 2)
+    updated_candidates = [item.get("updated_at") for item in (flow, headway, queue) if item.get("updated_at")]
+    return {
+        "minutes": safe_minutes,
+        "updated_at": updated_candidates[0] if updated_candidates else None,
+        "lanes": lanes,
+        "flow_total": flow_by_lane,
+        "headway_avg": headway_by_lane,
+        "base_queue": base_by_lane,
+        "queue_increment_avg": queue_increment_by_lane,
+        "queue_avg": queue_avg_by_lane,
+        "rows_used": {
+            "flow": flow.get("rows", 0),
+            "headway": headway.get("rows", 0),
+            "queue": queue.get("rows", 0),
+        },
+    }
+
+
+def read_flow_window_summary(minutes: int) -> dict[str, Any]:
+    safe_minutes = max(1, min(int(minutes or 60), 1440))
+    path = latest_csv_file("flow")
+    if path is None:
+        return {"file": None, "minutes": safe_minutes, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
+    max_lines = min(max(int(safe_minutes * 65) + 30, 400), 100000)
+    try:
+        header, data_lines = read_csv_tail_rows(path, max_lines=max_lines)
+        if not data_lines:
+            return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
         reader = csv.DictReader(StringIO(header + "\n" + "\n".join(data_lines) + "\n"))
         rows = list(reader)
         latest_ts = None
@@ -1014,8 +1194,8 @@ def read_flow_window_summary(hours: float) -> dict[str, Any]:
             except (TypeError, ValueError):
                 continue
         if latest_ts is None:
-            return {"file": str(path), "hours": safe_hours, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
-        start_ts = latest_ts - safe_hours * 3600
+            return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "total": 0, "rows": 0}
+        start_ts = latest_ts - safe_minutes * 60
         sums: dict[str, float] = {}
         used_rows = 0
         for row in rows:
@@ -1043,7 +1223,7 @@ def read_flow_window_summary(hours: float) -> dict[str, Any]:
         total = round(sum(by_lane.values()), 2)
         return {
             "file": str(path),
-            "hours": safe_hours,
+            "minutes": safe_minutes,
             "lanes": lanes,
             "by_lane": by_lane,
             "total": total,
@@ -1052,7 +1232,7 @@ def read_flow_window_summary(hours: float) -> dict[str, Any]:
             "end_ts": latest_ts,
         }
     except Exception as exc:
-        return {"file": str(path), "hours": safe_hours, "lanes": [], "by_lane": {}, "total": 0, "rows": 0, "error": str(exc)}
+        return {"file": str(path), "minutes": safe_minutes, "lanes": [], "by_lane": {}, "total": 0, "rows": 0, "error": str(exc)}
 
 
 def read_recent_log_events(limit: int = 12) -> list[str]:
@@ -1117,14 +1297,10 @@ def runtime_summary() -> dict[str, Any]:
     }
 
 
-def data_summary(hours: float = 1.0) -> dict[str, Any]:
+def data_summary(minutes: int = 60) -> dict[str, Any]:
     return {
-        "metrics": {
-            "flow": read_latest_csv_summary("flow"),
-            "headway": read_latest_csv_summary("headway"),
-            "queue": read_latest_csv_summary("queueLen"),
-        },
-        "flow_window": read_flow_window_summary(hours),
+        "latest_metrics_3m": read_recent_lane_metrics_summary(3),
+        "flow_window": read_flow_window_summary(minutes),
         "recent_events": read_recent_log_events(),
     }
 
@@ -1400,12 +1576,20 @@ def api_runtime_summary():
 
 @app.get("/api/data-summary")
 def api_data_summary():
-    raw_hours = request.args.get("hours", "1")
+    raw_minutes = request.args.get("minutes")
+    if raw_minutes is None and request.args.get("hours") is not None:
+        try:
+            raw_minutes = str(round(float(request.args.get("hours", "1")) * 60))
+        except (TypeError, ValueError):
+            raw_minutes = "60"
+    raw_minutes = raw_minutes or "60"
     try:
-        hours = float(raw_hours)
+        minutes = int(raw_minutes)
     except (TypeError, ValueError):
-        return jsonify({"ok": False, "message": "统计时长必须是数字"}), 400
-    return jsonify({"ok": True, "summary": data_summary(hours)})
+        return jsonify({"ok": False, "message": "统计时长必须是整数分钟"}), 400
+    if not (1 <= minutes <= 1440):
+        return jsonify({"ok": False, "message": "统计分钟数必须在 1 到 1440 之间"}), 400
+    return jsonify({"ok": True, "summary": data_summary(minutes)})
 
 
 @app.get("/api/signal-controller")
@@ -1497,16 +1681,63 @@ def api_step_tool_status():
     return jsonify(
         {
             "ok": True,
-            "message": "步进工具在线" if online else "步进工具离线",
+            "message": "智能控制在线" if online else "智能控制离线",
             "online": online,
             "raw": result,
         }
     )
 
 
-@app.post("/api/step-tool/tsc-config")
-def api_step_tool_tsc_config():
-    body = request.get_json(force=True)
+@app.get("/api/step-tool/service-status")
+def api_step_tool_service_status():
+    try:
+        result = step_tool_request("/api/v1/service/status")
+    except RuntimeError as exc:
+        fallback = tcp_check("127.0.0.1", 8080, timeout_sec=1.0)
+        if fallback["ok"]:
+            return jsonify(
+                {
+                    "ok": True,
+                    "message": "智能控制服务端口已开启，但 /api/v1/service/status 暂未返回 JSON",
+                    "running": True,
+                    "fallback": True,
+                    "detail": str(exc),
+                }
+            )
+        return jsonify({"ok": False, "message": str(exc), "running": False, "fallback": True}), 502
+    data = result.get("data")
+    if isinstance(data, bool):
+        running = data
+    elif isinstance(data, str):
+        running = data.strip().lower() in ("true", "1", "running", "active", "open", "on")
+    elif isinstance(data, dict):
+        running = any(
+            data.get(key) is True or str(data.get(key)).strip().lower() in ("true", "1", "running", "active", "open", "on")
+            for key in ("running", "active", "online", "status", "serviceStatus")
+        )
+    else:
+        running = bool(data)
+    return jsonify(
+        {
+            "ok": True,
+            "message": "智能控制服务已开启" if running else "智能控制服务未开启",
+            "running": running,
+            "raw": result,
+        }
+    )
+
+
+@app.post("/api/step-tool/restart-service")
+def api_step_tool_restart_service():
+    service_name = "preplan-control.service"
+    result = run_command(["systemctl", "restart", service_name], require_root=True, timeout=40)
+    if not result["ok"]:
+        return jsonify({"ok": False, "message": result["stderr"] or result["stdout"] or "智能控制服务重启失败"}), 500
+    log_line(f"[STEP] restart {service_name}")
+    return jsonify({"ok": True, "message": "智能控制服务已重启，请稍后重新查询状态"})
+
+
+def normalize_step_tool_config(body: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
     host = str(body.get("ip") or body.get("host") or "").strip()
     username = str(body.get("username") or "").strip()
     password = str(body.get("password") or "")
@@ -1514,31 +1745,124 @@ def api_step_tool_tsc_config():
     try:
         ensure_ipv4(host, "信号机 IP")
     except ValueError as exc:
-        return jsonify({"ok": False, "message": str(exc)}), 400
+        return None, str(exc)
     if not username:
-        return jsonify({"ok": False, "message": "账户不能为空"}), 400
+        return None, "账户不能为空"
     if not password:
-        return jsonify({"ok": False, "message": "密码不能为空"}), 400
+        return None, "密码不能为空"
     try:
         port = int(port_raw)
     except (TypeError, ValueError):
-        return jsonify({"ok": False, "message": "端口号必须是数字"}), 400
+        return None, "端口号必须是数字"
     if not (1 <= port <= 65535):
-        return jsonify({"ok": False, "message": "端口号超出范围"}), 400
+        return None, "端口号超出范围"
+    return {"ip": host, "port": port, "username": username, "password": password}, None
+
+
+def phase_id_from_status(data: dict[str, Any]) -> int | None:
+    sorted_phase_status = data.get("sortedPhaseStatus")
+    if isinstance(sorted_phase_status, list):
+        for item in sorted_phase_status:
+            if isinstance(item, dict) and item.get("phaseID") is not None:
+                try:
+                    return int(item["phaseID"])
+                except (TypeError, ValueError):
+                    continue
+    phase_ring = data.get("phaseRing")
+    if isinstance(phase_ring, list):
+        for item in phase_ring:
+            try:
+                return int(item)
+            except (TypeError, ValueError):
+                continue
+    phase_status = data.get("phaseStatus")
+    if isinstance(phase_status, dict):
+        for key, item in phase_status.items():
+            phase_id = item.get("phaseID") if isinstance(item, dict) else key
+            try:
+                return int(phase_id)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+@app.post("/api/step-tool/tsc-config")
+def api_step_tool_tsc_config():
+    body = request.get_json(force=True)
+    payload, error_message = normalize_step_tool_config(body)
+    if error_message:
+        return jsonify({"ok": False, "message": error_message}), 400
 
     try:
         result = step_tool_request(
             "/api/v1/tsc/config",
             method="POST",
-            payload={"ip": host, "port": port, "username": username, "password": password},
+            payload=payload,
         )
     except RuntimeError as exc:
         return jsonify({"ok": False, "message": str(exc)}), 502
     success = result.get("data") is not False
+    if not success:
+        return jsonify(
+            {
+                "ok": False,
+                "message": str(result.get("message") or "参数发送失败"),
+                "success": False,
+                "raw": result,
+            }
+        ), 502
+    try:
+        test_result = step_tool_request(
+            "/api/v1/tsc/connection/test",
+            method="POST",
+            payload=payload,
+        )
+    except RuntimeError as exc:
+        return jsonify(
+            {
+                "ok": False,
+                "message": f"参数已发送，但信号机登录测试失败：{exc}",
+                "success": False,
+                "raw": result,
+            }
+        ), 502
+    test_success = test_result.get("data") is not False
+    if not test_success:
+        return jsonify(
+            {
+                "ok": False,
+                "message": str(test_result.get("message") or "参数已发送，但信号机登录测试失败"),
+                "success": False,
+                "raw": result,
+                "connection_test": test_result,
+            }
+        ), 502
+    return jsonify(
+        {
+            "ok": True,
+            "message": str(test_result.get("message") or "参数发送成功，信号机登录测试成功"),
+            "success": True,
+            "raw": result,
+            "connection_test": test_result,
+        }
+    )
+
+
+@app.post("/api/step-tool/tsc-connection-test")
+def api_step_tool_tsc_connection_test():
+    body = request.get_json(force=True)
+    payload, error_message = normalize_step_tool_config(body)
+    if error_message:
+        return jsonify({"ok": False, "message": error_message}), 400
+    try:
+        result = step_tool_request("/api/v1/tsc/connection/test", method="POST", payload=payload)
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc), "success": False}), 502
+    success = result.get("data") is not False
     return jsonify(
         {
             "ok": success,
-            "message": str(result.get("message") or ("参数发送成功" if success else "参数发送失败")),
+            "message": str(result.get("message") or ("信号机登录测试成功" if success else "信号机登录测试失败")),
             "success": success,
             "raw": result,
         }
@@ -1578,7 +1902,7 @@ def api_step_tool_tsc_status():
     try:
         ctrl_mode_id = int(ctrl_mode)
     except (TypeError, ValueError):
-        return jsonify({"ok": False, "message": "步进工具返回的控制模式无效", "raw": result}), 502
+        return jsonify({"ok": False, "message": "智能控制返回的控制模式无效", "raw": result}), 502
     label = CTRL_MODE_LABELS.get(ctrl_mode_id, f"未知控制模式 {ctrl_mode_id}")
     return jsonify(
         {
@@ -1586,7 +1910,107 @@ def api_step_tool_tsc_status():
             "message": f"当前控制模式：{label}",
             "ctrl_mode": ctrl_mode_id,
             "ctrl_mode_label": label,
+            "step_control": bool(data.get("stepControl")),
+            "phase_id": phase_id_from_status(data),
+            "status_data": data,
             "raw": result,
+        }
+    )
+
+
+@app.post("/api/step-tool/step-control-test")
+def api_step_tool_step_control_test():
+    body = request.get_json(silent=True) or {}
+    try:
+        duration = int(body.get("duration", 30))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "步进控制时长必须是整数秒"}), 400
+    if not (1 <= duration <= 3600):
+        return jsonify({"ok": False, "message": "步进控制时长必须在 1 到 3600 秒之间"}), 400
+    try:
+        before_result = step_tool_request("/api/v1/tsc/status")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": f"获取当前控制状态失败：{exc}"}), 502
+    before_data = before_result.get("data") or {}
+    phase_id = phase_id_from_status(before_data)
+    if phase_id is None:
+        return jsonify({"ok": False, "message": "未从智能控制状态中找到可测试的 phaseID", "raw": before_result}), 502
+    try:
+        control_result = step_tool_request(
+            "/api/v1/tsc/stepControl",
+            method="POST",
+            payload={"phaseId": phase_id, "duration": duration},
+        )
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": f"步进控制指令发送失败：{exc}", "phase_id": phase_id}), 502
+    control_success = control_result.get("data") is not False
+    if not control_success:
+        return jsonify(
+            {
+                "ok": False,
+                "message": str(control_result.get("message") or "步进控制指令发送失败"),
+                "phase_id": phase_id,
+                "before": before_result,
+                "control": control_result,
+            }
+        ), 502
+    try:
+        after_result = step_tool_request("/api/v1/tsc/status")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": f"步进控制已发送，但刷新控制状态失败：{exc}", "phase_id": phase_id}), 502
+    after_data = after_result.get("data") or {}
+    ctrl_mode = after_data.get("ctrlMode")
+    try:
+        ctrl_mode_id = int(ctrl_mode)
+    except (TypeError, ValueError):
+        ctrl_mode_id = None
+    label = CTRL_MODE_LABELS.get(ctrl_mode_id, f"未知控制模式 {ctrl_mode_id}") if ctrl_mode_id is not None else "未知控制模式"
+    step_control = bool(after_data.get("stepControl")) or ctrl_mode_id == 10
+    message = f"已对 phaseID {phase_id} 发送 {duration} 秒步进控制，当前控制模式：{label}"
+    if step_control:
+        message = f"{message}，步进控制已生效"
+    else:
+        message = f"{message}，暂未确认进入步进控制"
+    return jsonify(
+        {
+            "ok": True,
+            "message": message,
+            "success": step_control,
+            "phase_id": phase_id,
+            "duration": duration,
+            "ctrl_mode": ctrl_mode_id,
+            "ctrl_mode_label": label,
+            "step_control": step_control,
+            "before": before_result,
+            "control": control_result,
+            "after": after_result,
+            "status_data": after_data,
+        }
+    )
+
+
+@app.post("/api/step-tool/step-control-cancel")
+def api_step_tool_step_control_cancel():
+    try:
+        cancel_result = step_tool_request("/api/v1/tsc/stepControl/cancel", method="POST")
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": f"取消步进控制失败：{exc}"}), 502
+    success = cancel_result.get("data") is not False
+    if not success:
+        return jsonify({"ok": False, "message": str(cancel_result.get("message") or "取消步进控制失败"), "raw": cancel_result}), 502
+    try:
+        status_result = step_tool_request("/api/v1/tsc/status")
+    except RuntimeError:
+        status_result = None
+    status_data = (status_result or {}).get("data") or {}
+    return jsonify(
+        {
+            "ok": True,
+            "message": str(cancel_result.get("message") or "已取消步进控制"),
+            "success": True,
+            "raw": cancel_result,
+            "after": status_result,
+            "status_data": status_data,
         }
     )
 
