@@ -9,6 +9,7 @@ import shutil
 import shlex
 import socket
 import subprocess
+import tarfile
 import time
 import uuid
 from io import StringIO
@@ -19,7 +20,7 @@ from urllib import error as urlerror
 from urllib import request as urlrequest
 from urllib.parse import quote, unquote, urlencode, urlparse, urlunparse
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -40,6 +41,12 @@ TRAFFIC_CONFIG_DIR = TRAFFIC_ROOT / "config"
 TRAFFIC_LOG_DIR = TRAFFIC_ROOT / "log"
 TRAFFIC_QUEUE_DIR = TRAFFIC_ROOT / "queue_csv"
 TRAFFIC_RUNTIME_ENV_PATH = TRAFFIC_ROOT / "runtime.env"
+PROJECT_LOG_ROOT = Path(os.getenv("BOX_CONFIG_LOG_ROOT", str(PROJECT_ROOT / "logs")))
+BOX_ADMIN_LOG_DIR = PROJECT_LOG_ROOT / "box_admin"
+CONFIG_AGENT_LOG_DIR = PROJECT_LOG_ROOT / "config_agent"
+TRAFFIC_SERVICE_LOG_DIR = PROJECT_LOG_ROOT / "traffic_detect"
+PREPLAN_SERVICE_LOG_DIR = PROJECT_LOG_ROOT / "preplan_control"
+RELEASE_DIR = PROJECT_ROOT / "release"
 CAMERA_BINDINGS_PATH = Path(
     os.getenv(
         "BOX_ADMIN_CAMERA_BINDINGS",
@@ -95,6 +102,7 @@ SERVICE_DISPLAY_NAMES = {
     "traffic_detect.service": "路口感知检测服务",
     "config_agent.service": "检测线数据接收服务",
     "box_admin.service": "智能感知系统配置工具服务",
+    "preplan-control.service": "智能控制服务",
 }
 SERVICE_STATUS_LABELS = {
     "active": "运行中",
@@ -121,6 +129,12 @@ CALIBRATION_FILES = {
     "headway_config": TRAFFIC_CONFIG_DIR / "headway_config.json",
     "base_length": TRAFFIC_CONFIG_DIR / "base_length.json",
 }
+DIAGNOSTIC_SERVICES = [
+    "box_admin.service",
+    "config_agent.service",
+    "traffic_detect.service",
+    "preplan-control.service",
+]
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
@@ -1494,6 +1508,420 @@ def read_recent_log_events(limit: int = 12) -> list[str]:
     return interesting[-limit:]
 
 
+def latest_release_log_bundle() -> Path | None:
+    files = [path for path in RELEASE_DIR.glob("diagnostics_*.tar.gz") if path.is_file()]
+    if not files:
+        return None
+    return max(files, key=lambda item: item.stat().st_mtime)
+
+
+def read_recent_text_lines(paths: list[Path], limit: int = 160) -> list[str]:
+    for path in paths:
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            with path.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                pos = handle.tell()
+                tail = b""
+                block_size = 8192
+                while pos > 0 and tail.count(b"\n") <= limit * 3:
+                    read_size = min(block_size, pos)
+                    pos -= read_size
+                    handle.seek(pos)
+                    tail = handle.read(read_size) + tail
+            lines = [line.rstrip() for line in tail.decode("utf-8", errors="ignore").splitlines() if line.strip()]
+            return lines[-limit:]
+        except Exception:
+            continue
+    return []
+
+
+def find_matching_lines(lines: list[str], patterns: list[str], limit: int = 6) -> list[str]:
+    matches: list[str] = []
+    lowered_patterns = [pattern.lower() for pattern in patterns]
+    for line in lines:
+        lowered = line.lower()
+        if any(pattern in lowered for pattern in lowered_patterns):
+            matches.append(line.strip())
+    return matches[-limit:]
+
+
+def add_issue(
+    issues: list[dict[str, Any]],
+    issue_id: str,
+    severity: str,
+    component: str,
+    title: str,
+    summary: str,
+    possible_causes: list[str],
+    evidence: list[str],
+) -> None:
+    if any(item["id"] == issue_id for item in issues):
+        return
+    issues.append(
+        {
+            "id": issue_id,
+            "severity": severity,
+            "component": component,
+            "component_label": service_display_name(component) if component.endswith(".service") else component,
+            "title": title,
+            "summary": summary,
+            "possible_causes": possible_causes,
+            "evidence": evidence[:6],
+        }
+    )
+
+
+def service_runtime_snapshot(name: str) -> dict[str, Any]:
+    payload = service_status(name, use_cache=False)
+    enabled = payload.get("autostart")
+    payload["present"] = enabled != "not-found"
+    return payload
+
+
+def detect_runtime_issues() -> dict[str, Any]:
+    services = {name: service_runtime_snapshot(name) for name in DIAGNOSTIC_SERVICES}
+    signal = get_signal_controller_config()
+    signal_ping, signal_tcp = get_signal_checks(signal["host"], signal["port"], force=True)
+    config_agent_lines = read_recent_text_lines(
+        [
+            CONFIG_AGENT_LOG_DIR / "config_agent.log",
+            CONFIG_AGENT_LOG_DIR / "service.log",
+        ],
+        limit=220,
+    )
+    traffic_lines = read_recent_text_lines(
+        [
+            TRAFFIC_SERVICE_LOG_DIR / "service.log",
+            TRAFFIC_LOG_DIR / "runtime_main.log",
+        ],
+        limit=260,
+    )
+    box_admin_lines = read_recent_text_lines(
+        [
+            BOX_ADMIN_LOG_DIR / "box_admin.log",
+            BOX_ADMIN_LOG_DIR / "service.log",
+        ],
+        limit=160,
+    )
+    preplan_lines = read_recent_text_lines(
+        [
+            PREPLAN_SERVICE_LOG_DIR / "service.log",
+            PROJECT_ROOT / "preplan-control-server" / "logs" / "service.log",
+        ],
+        limit=160,
+    )
+    queue_summary = read_metric_series("queueLen", 30)
+    latest_data_time = queue_summary.get("updated_at")
+    now_ts = time.time()
+    latest_data_age = None
+    if latest_data_time:
+        try:
+            latest_data_age = round(
+                now_ts - time.mktime(time.strptime(str(latest_data_time), "%Y-%m-%d %H:%M:%S")),
+                1,
+            )
+        except Exception:
+            latest_data_age = None
+
+    issues: list[dict[str, Any]] = []
+
+    for service_name, snapshot in services.items():
+        if not snapshot["present"] and service_name == "preplan-control.service":
+            continue
+        if snapshot["status"] not in {"active", "running"}:
+            add_issue(
+                issues,
+                f"service-{service_name}",
+                "high" if service_name != "preplan-control.service" else "medium",
+                service_name,
+                "服务未正常运行",
+                f"{service_display_name(service_name)} 当前不是运行状态。",
+                [
+                    "服务进程退出或启动失败",
+                    "依赖环境、配置文件或端口占用导致启动没有成功",
+                    "盒子重启后服务未按预期拉起",
+                ],
+                [snapshot.get("detail") or snapshot.get("status_label")],
+            )
+
+    config_conflict_lines = find_matching_lines(config_agent_lines, ["address already in use", "18080"])
+    if config_conflict_lines:
+        add_issue(
+            issues,
+            "config-agent-port-conflict",
+            "high",
+            "config_agent.service",
+            "配置接收端口被占用",
+            "配置接收服务最近出现 18080 端口占用。",
+            [
+                "现场残留旧的 config-agent.service / config-agent.servicec 仍在运行",
+                "旧工程路径下的 Config_agent 进程还没有退出",
+                "同机其他程序占用了 18080 端口",
+            ],
+            config_conflict_lines,
+        )
+
+    config_validation_lines = find_matching_lines(config_agent_lines, ["validation failed", "[req][unauthorized]", "restart failed", "transform failed", "reindex failed"])
+    if config_validation_lines:
+        add_issue(
+            issues,
+            "config-agent-request-failed",
+            "medium",
+            "config_agent.service",
+            "配置接收最近有失败记录",
+            "配置接收服务最近处理请求时出现失败。",
+            [
+                "配置内容格式与当前版本要求不一致",
+                "接口 token、请求路径或 body 结构不匹配",
+                "配置写入成功后重启感知服务失败",
+            ],
+            config_validation_lines,
+        )
+
+    traffic_rtsp_lines = find_matching_lines(
+        traffic_lines,
+        [
+            "could not open resource for reading and writing",
+            "failed to connect. (timeout while waiting for server response)",
+            "gst_rtspsrc_retrieve_sdp",
+            "perf: 0.00",
+            "timeout while waiting for server response",
+        ],
+    )
+    if traffic_rtsp_lines:
+        add_issue(
+            issues,
+            "traffic-rtsp",
+            "high",
+            "traffic_detect.service",
+            "视频流接入不稳定",
+            "路口感知检测最近出现视频流打开失败或拉流超时。",
+            [
+                "相机 RTSP 地址、账号、密码或路径异常",
+                "盒子到相机网段的路由或有线链路不稳定",
+                "DeepStream 正在反复重连视频流，导致检测数据断续",
+            ],
+            traffic_rtsp_lines,
+        )
+
+    receiver_lines = find_matching_lines(traffic_lines, ["sender id and receiver id must be set", "receiver id"])
+    if receiver_lines:
+        add_issue(
+            issues,
+            "traffic-receiver-id",
+            "medium",
+            "traffic_detect.service",
+            "信号机接入参数未准备好",
+            "路口感知检测最近出现信号机接入参数未就绪的提示。",
+            [
+                "当前网络环境下信号机未连通",
+                "运行中的感知服务版本较旧，未带保护逻辑",
+                "运行参数里的信号机 IP、端口或接收端参数未正确加载",
+            ],
+            receiver_lines,
+        )
+
+    if services["traffic_detect.service"]["status"] in {"active", "running"} and latest_data_age is not None and latest_data_age > 180:
+        add_issue(
+            issues,
+            "traffic-no-fresh-data",
+            "medium",
+            "traffic_detect.service",
+            "最近没有新的检测数据",
+            "感知服务在运行，但最近 3 分钟没有新的车道数据写入。",
+            [
+                "视频流没有稳定打开，导致检测结果没有持续产出",
+                "检测线程仍在运行，但输出目录或 CSV 写入没有继续更新",
+                "现场网络切换后，盒子到相机或信号机的链路暂时中断",
+            ],
+            [f"最近检测数据时间：{latest_data_time}", f"距今约 {latest_data_age} 秒"],
+        )
+
+    if signal["host"] and (not signal_ping.get("ok") or not signal_tcp.get("ok")):
+        add_issue(
+            issues,
+            "signal-unreachable",
+            "medium",
+            "signal_controller",
+            "信号机网络暂不可达",
+            "当前保存的信号机地址没有通过连通性检查。",
+            [
+                "盒子当前网络没有接入信号机所在网段",
+                "信号机地址、端口配置不正确",
+                "信控网链路或交换设备暂时不通",
+            ],
+            [
+                f"信号机 IP：{signal['host']}:{signal['port']}",
+                signal_ping.get("message") or "Ping 检查未通过",
+                signal_tcp.get("message") or "TCP 检查未通过",
+            ],
+        )
+
+    preplan_status = services["preplan-control.service"]
+    if preplan_status["present"] and preplan_status["status"] not in {"active", "running", "inactive"}:
+        add_issue(
+            issues,
+            "preplan-service-failed",
+            "medium",
+            "preplan-control.service",
+            "智能控制服务未正常启动",
+            "智能控制服务当前不是可用状态。",
+            [
+                "Java 服务本体没有启动成功",
+                "运行环境或 jar 包缺失",
+                "服务启动后异常退出",
+            ],
+            find_matching_lines(preplan_lines, ["error", "exception", "failed"]) or [preplan_status.get("detail") or preplan_status.get("status_label")],
+        )
+
+    overview = [
+        {
+            "key": "box_admin",
+            "label": "配置工具",
+            "status": services["box_admin.service"]["status"],
+            "status_label": services["box_admin.service"]["status_label"],
+            "detail": services["box_admin.service"].get("detail") or "",
+        },
+        {
+            "key": "config_agent",
+            "label": "配置接收",
+            "status": services["config_agent.service"]["status"],
+            "status_label": services["config_agent.service"]["status_label"],
+            "detail": services["config_agent.service"].get("detail") or "",
+        },
+        {
+            "key": "traffic_detect",
+            "label": "感知检测",
+            "status": services["traffic_detect.service"]["status"],
+            "status_label": services["traffic_detect.service"]["status_label"],
+            "detail": f"最近数据：{latest_data_time or '等待数据更新'}",
+        },
+        {
+            "key": "signal_controller",
+            "label": "信号机连通",
+            "status": "ok" if signal_ping.get("ok") and signal_tcp.get("ok") else "warning",
+            "status_label": "正常" if signal_ping.get("ok") and signal_tcp.get("ok") else "待检查",
+            "detail": f"{signal['host']}:{signal['port']}",
+        },
+    ]
+    if preplan_status["present"]:
+        overview.append(
+            {
+                "key": "preplan_control",
+                "label": "智能控制",
+                "status": preplan_status["status"],
+                "status_label": preplan_status["status_label"],
+                "detail": preplan_status.get("detail") or "",
+            }
+        )
+
+    bundle = latest_release_log_bundle()
+    bundle_payload = None
+    if bundle:
+        bundle_payload = {
+            "filename": bundle.name,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(bundle.stat().st_mtime)),
+            "download_url": f"/api/runtime-diagnostics/download/{bundle.name}",
+        }
+
+    return {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts)),
+        "services": list(services.values()),
+        "overview": overview,
+        "issues": issues,
+        "issue_count": len(issues),
+        "latest_data_time": latest_data_time,
+        "latest_data_age_seconds": latest_data_age,
+        "latest_bundle": bundle_payload,
+    }
+
+
+def export_runtime_log_bundle() -> dict[str, Any]:
+    script_path = PROJECT_ROOT / "scripts" / "collect_box_logs.sh"
+    RELEASE_DIR.mkdir(parents=True, exist_ok=True)
+    bundle_path: Path | None = None
+    if script_path.exists():
+        try:
+            result = subprocess.run(
+                ["bash", str(script_path)],
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                timeout=180,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("日志打包超时，请稍后重试") from exc
+        output = "\n".join(part for part in [result.stdout, result.stderr] if part)
+        match = re.search(r"\[diagnostics\]\s+created:\s+(.+)", output)
+        bundle_path = Path(match.group(1).strip()) if match else latest_release_log_bundle()
+        if result.returncode != 0 and bundle_path is None:
+            raise RuntimeError("日志打包失败，请检查 release 目录或脚本输出")
+    else:
+        bundle_path = export_runtime_log_bundle_fallback()
+    if bundle_path is None or not bundle_path.exists():
+        raise RuntimeError("日志包未生成成功，请稍后再试")
+    return {
+        "filename": bundle_path.name,
+        "download_url": f"/api/runtime-diagnostics/download/{bundle_path.name}",
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(bundle_path.stat().st_mtime)),
+        "message": "最近运行日志已打包，可直接导出发送给技术人员",
+    }
+
+
+def export_runtime_log_bundle_fallback() -> Path:
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    out_dir = RELEASE_DIR / f"diagnostics_{stamp}"
+    out_tar = RELEASE_DIR / f"diagnostics_{stamp}.tar.gz"
+    (out_dir / "service_status").mkdir(parents=True, exist_ok=True)
+    (out_dir / "logs").mkdir(parents=True, exist_ok=True)
+    (out_dir / "configs").mkdir(parents=True, exist_ok=True)
+
+    def capture_to(path: Path, args: list[str], require_root: bool = False, timeout: int = 20) -> None:
+        result = run_command(args, require_root=require_root, timeout=timeout)
+        text = "\n".join(
+            part for part in [result.get("stdout", ""), result.get("stderr", "")] if part
+        ) or result.get("cmd", "")
+        path.write_text(text + "\n", encoding="utf-8")
+
+    capture_to(out_dir / "service_status" / "system_overview.txt", ["uname", "-a"])
+    capture_to(out_dir / "service_status" / "free.txt", ["free", "-h"])
+    capture_to(out_dir / "service_status" / "uptime.txt", ["uptime"])
+    capture_to(out_dir / "service_status" / "df.txt", ["df", "-h"])
+    capture_to(out_dir / "service_status" / "ps_top.txt", ["ps", "-eo", "pid,user,comm,rss,args", "--sort=-rss"])
+    capture_to(out_dir / "service_status" / "listening_ports.txt", ["ss", "-ltnp"])
+    for service in DIAGNOSTIC_SERVICES:
+        capture_to(out_dir / "service_status" / f"{service}.status.txt", ["systemctl", "status", service, "--no-pager"])
+        capture_to(out_dir / "service_status" / f"{service}.journal.txt", ["journalctl", "-u", service, "-n", "200", "--no-pager"], require_root=False, timeout=30)
+
+    copy_pairs = [
+        (PROJECT_LOG_ROOT, out_dir / "logs" / "runtime_logs"),
+        (TRAFFIC_LOG_DIR, out_dir / "logs" / "traffic_log_dir"),
+        (TRAFFIC_QUEUE_DIR, out_dir / "logs" / "queue_csv"),
+        (BOX_ADMIN_LOG_DIR, out_dir / "logs" / "box_admin_logs"),
+        (CONFIG_AGENT_LOG_DIR, out_dir / "logs" / "config_agent_logs"),
+        (PROJECT_ROOT / "preplan-control-server" / "logs", out_dir / "logs" / "preplan_control_logs"),
+        (PROJECT_ROOT / "Box_admin" / "config", out_dir / "configs" / "box_admin"),
+        (TRAFFIC_CONFIG_DIR, out_dir / "configs" / "traffic_detect"),
+        (DEEPSTREAM_CONFIG_PATH, out_dir / "configs" / "deepstream_app_config.txt"),
+    ]
+    for src, dst in copy_pairs:
+        if not src.exists():
+            continue
+        if src.is_dir():
+            shutil.copytree(src, dst, dirs_exist_ok=True)
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+
+    with tarfile.open(out_tar, "w:gz") as tar:
+        tar.add(out_dir, arcname=out_dir.name)
+    shutil.rmtree(out_dir, ignore_errors=True)
+    return out_tar
+
+
 def get_calibration_status() -> list[dict[str, Any]]:
     items = []
     for name, path in CALIBRATION_FILES.items():
@@ -1924,6 +2352,31 @@ def api_data_log():
     if not (1 <= minutes <= 180):
         return jsonify({"ok": False, "message": "数据日志时长必须在 1 到 180 分钟之间"}), 400
     return jsonify({"ok": True, "summary": build_data_log_summary(minutes)})
+
+
+@app.get("/api/runtime-diagnostics")
+def api_runtime_diagnostics():
+    return jsonify({"ok": True, "summary": detect_runtime_issues()})
+
+
+@app.post("/api/runtime-diagnostics/export")
+def api_runtime_diagnostics_export():
+    try:
+        payload = export_runtime_log_bundle()
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 500
+    return jsonify({"ok": True, **payload})
+
+
+@app.get("/api/runtime-diagnostics/download/<path:filename>")
+def api_runtime_diagnostics_download(filename: str):
+    safe_name = Path(filename).name
+    if not re.fullmatch(r"diagnostics_[A-Za-z0-9_\-]+\.tar\.gz", safe_name):
+        return jsonify({"ok": False, "message": "日志包文件名无效"}), 400
+    bundle_path = RELEASE_DIR / safe_name
+    if not bundle_path.exists() or not bundle_path.is_file():
+        return jsonify({"ok": False, "message": "日志包不存在，请重新导出"}), 404
+    return send_file(bundle_path, as_attachment=True, download_name=safe_name)
 
 
 @app.get("/api/signal-controller")

@@ -146,6 +146,33 @@
           </article>
         </section>
 
+        <section class="page-panel" data-page-key="runtime-log" data-page-title="运行日志">
+          <div class="section-head">
+            <h2>运行日志</h2>
+            <p>集中查看整套服务的运行情况，出现问题时可直接导出最近日志发送给技术人员。</p>
+          </div>
+          <article class="card">
+            <div class="section-toolbar">
+              <div>
+                <h3>运行概览</h3>
+                <div id="runtimeDiagMeta" class="subtle">进入页面后将自动读取当前运行状态。</div>
+              </div>
+              <div class="actions">
+                <button id="refreshRuntimeDiagBtn" class="btn secondary">刷新运行日志</button>
+                <button id="exportRuntimeLogsBtn" class="btn primary">导出最近运行日志</button>
+              </div>
+            </div>
+            <div id="runtimeDiagOverview" class="status-cards"></div>
+            <div id="runtimeDiagBundle" class="subtle"></div>
+          </article>
+          <article class="card">
+            <h3>问题定位</h3>
+            <div class="table-wrap">
+              <table id="runtimeDiagIssueTable" class="data-table compact-table"></table>
+            </div>
+          </article>
+        </section>
+
         <section class="page-panel" data-page-key="step-control" data-page-title="信号机与智能控制平台连通状态">
           <div class="section-head">
             <h2>信号机与智能控制平台连通状态</h2>

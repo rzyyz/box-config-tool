@@ -701,6 +701,100 @@ function renderRecentEvents(events) {
 }
 
 
+function severityBadge(level) {
+  const cls = {
+    high: "err",
+    medium: "warn",
+    low: "info",
+  }[level] || "dim";
+  const label = {
+    high: "需处理",
+    medium: "待检查",
+    low: "提示",
+  }[level] || "已记录";
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+
+
+function renderRuntimeDiagOverview(summary) {
+  const root = document.getElementById("runtimeDiagOverview");
+  const items = Array.isArray(summary?.overview) ? summary.overview : [];
+  if (!items.length) {
+    setHtmlIfChanged(root, `<div class="status-card"><span class="label">运行概览</span><span class="value">暂未读取到运行信息</span></div>`);
+    return;
+  }
+  const html = items.map((item) => `
+    <div class="status-card">
+      <span class="label">${escapeHtml(item.label || "-")}</span>
+      <div class="status-inline">
+        ${statusBadge(item.status, item.status_label)}
+      </div>
+      <span class="value">${escapeHtml(item.detail || "-")}</span>
+    </div>
+  `).join("");
+  setHtmlIfChanged(root, html);
+}
+
+
+function renderRuntimeDiagBundle(bundle) {
+  const root = document.getElementById("runtimeDiagBundle");
+  if (!root) {
+    return;
+  }
+  if (!bundle?.filename) {
+    root.textContent = "暂未导出日志包。";
+    return;
+  }
+  root.textContent = `最近日志包：${bundle.filename}，更新时间 ${bundle.updated_at || "-"}`;
+}
+
+
+function renderRuntimeDiagIssues(summary) {
+  const root = document.getElementById("runtimeDiagIssueTable");
+  const issues = Array.isArray(summary?.issues) ? summary.issues : [];
+  if (!issues.length) {
+    setHtmlIfChanged(root, `
+      <tbody>
+        <tr>
+          <td>当前未识别到明确异常，整套服务看起来在正常运行。</td>
+        </tr>
+      </tbody>
+    `);
+    return;
+  }
+  const rows = issues.map((issue) => `
+    <tr>
+      <td>
+        <div class="status-inline">
+          ${severityBadge(issue.severity)}
+        </div>
+      </td>
+      <td>
+        <strong>${escapeHtml(issue.component_label || issue.component || "-")}</strong>
+      </td>
+      <td>
+        <strong>${escapeHtml(issue.title || "-")}</strong>
+        <div class="subtle">${escapeHtml(issue.summary || "")}</div>
+      </td>
+      <td>${(issue.possible_causes || []).map((item) => `<div class="subtle">${escapeHtml(item)}</div>`).join("") || "-"}</td>
+      <td>${(issue.evidence || []).map((item) => `<div class="log-line">${escapeHtml(item)}</div>`).join("") || "-"}</td>
+    </tr>
+  `).join("");
+  setHtmlIfChanged(root, `
+    <thead>
+      <tr>
+        <th>等级</th>
+        <th>环节</th>
+        <th>当前问题</th>
+        <th>可能原因</th>
+        <th>关键证据</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  `);
+}
+
+
 function metricNumber(value, digits = 2) {
   const num = Number(value);
   if (!Number.isFinite(num)) {
@@ -953,6 +1047,19 @@ async function loadDataLogSummary() {
 }
 
 
+async function loadRuntimeDiagnostics() {
+  const data = await fetchJson("/api/runtime-diagnostics");
+  const summary = data.summary || {};
+  const meta = document.getElementById("runtimeDiagMeta");
+  renderRuntimeDiagOverview(summary);
+  renderRuntimeDiagBundle(summary.latest_bundle || null);
+  renderRuntimeDiagIssues(summary);
+  if (meta) {
+    meta.textContent = `最近分析时间 ${summary.generated_at || "-"}，当前识别到 ${summary.issue_count || 0} 个需要关注的环节。`;
+  }
+}
+
+
 function stopDataLogAutoRefresh() {
   if (dataLogRefreshTimer) {
     clearInterval(dataLogRefreshTimer);
@@ -1005,6 +1112,8 @@ async function loadPageData(key, force = false) {
     await loadCalibrationStatus();
   } else if (key === "runtime") {
     await loadRuntimeSummary();
+  } else if (key === "runtime-log") {
+    await loadRuntimeDiagnostics();
   } else if (key === "step-control") {
     await loadRuntimeSummary();
     renderStepControlPage();
@@ -1111,6 +1220,36 @@ function wireActions() {
       showToast("数据检测已刷新", true);
     } catch (error) {
       showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("refreshRuntimeDiagBtn").addEventListener("click", async () => {
+    clearToast();
+    try {
+      await loadRuntimeDiagnostics();
+      loadedPages.add("runtime-log");
+      showToast("运行日志已刷新", true);
+    } catch (error) {
+      showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("exportRuntimeLogsBtn").addEventListener("click", async () => {
+    clearToast();
+    const button = document.getElementById("exportRuntimeLogsBtn");
+    const previousText = button.textContent;
+    button.disabled = true;
+    button.textContent = "打包中...";
+    try {
+      const data = await fetchJson("/api/runtime-diagnostics/export", { method: "POST" });
+      await loadRuntimeDiagnostics();
+      window.open(data.download_url, "_blank", "noopener,noreferrer");
+      showToast(data.message || "最近运行日志已导出", true);
+    } catch (error) {
+      showToast(error.message, false);
+    } finally {
+      button.disabled = false;
+      button.textContent = previousText;
     }
   });
 
