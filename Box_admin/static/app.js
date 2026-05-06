@@ -714,7 +714,7 @@ function freshnessBadge(status, label) {
   const cls = {
     fresh: "ok",
     lagging: "warn",
-    stale: "err",
+    stale: "warn",
     empty: "dim",
   }[status] || "dim";
   return `<span class="badge ${cls}">${escapeHtml(label || "暂无数据")}</span>`;
@@ -804,7 +804,7 @@ function renderDataLogStatusCards(summary) {
   const root = document.getElementById("dataLogStatusCards");
   const cards = [
     { label: "观察窗口", value: `最近 ${summary.minutes || DATA_LOG_WINDOW_MINUTES} 分钟` },
-    { label: "最近数据时间", value: summary.latest_at || "最近还没有检测数据" },
+    { label: "最近数据时间", value: summary.latest_at || "等待数据更新" },
     { label: "当前车道数", value: String(summary.lane_count || 0) },
     { label: "页面刷新", value: `打开本页后每 ${Math.round(DATA_LOG_REFRESH_MS / 1000)} 秒自动更新` },
   ];
@@ -817,12 +817,11 @@ function renderDataLogStatusCards(summary) {
 }
 
 
-function renderMetricBrief(metric, unit = "") {
+function renderMetricBrief(metric, unit = "", extraLines = []) {
   return `
     <div class="metric-brief">
       <span class="value">${metricNumber(metric?.current)}${unit}</span>
-      <span class="subtle">30分钟峰值 ${metricNumber(metric?.peak)}${unit}</span>
-      <span class="subtle">30分钟均值 ${metricNumber(metric?.average)}${unit}</span>
+      ${extraLines.map((line) => `<span class="subtle">${line}</span>`).join("")}
     </div>
   `;
 }
@@ -845,22 +844,18 @@ function renderDataLogLaneTable(summary) {
         <div class="status-inline">
           ${freshnessBadge(item.freshness, item.freshness_label)}
         </div>
-        <div class="subtle">${item.stale_seconds == null ? "暂无新样本" : `${metricNumber(item.stale_seconds, 1)} 秒前更新`}</div>
+        <div class="subtle">${item.stale_seconds == null ? "等待数据更新" : `${metricNumber(item.stale_seconds, 1)} 秒前更新`}</div>
       </td>
-      <td>${renderMetricBrief(item.flow, "")}</td>
-      <td>${renderMetricBrief(item.headway, " s")}</td>
-      <td>${renderMetricBrief(item.queue, " m")}</td>
       <td>
         <div class="metric-brief">
-          <span class="value">${metricNumber(item.queue?.peak)} m</span>
-          <span class="subtle">最近变化 ${metricNumber(item.queue?.delta)} m</span>
-          <span class="subtle">波动范围 ${metricNumber(item.queue?.swing)} m</span>
+          <span class="value">${metricNumber(item.flow?.total)}</span>
+          <span class="subtle">最近 30 分钟累计</span>
         </div>
       </td>
-      <td class="trend-note">
-        <strong>${escapeHtml(item.queue?.trend_label || "暂无判断")}</strong>
-        <div class="subtle">${escapeHtml(item.queue?.trend_note || "最近暂无排队数据。")}</div>
-      </td>
+      <td>${renderMetricBrief({ current: item.headway?.average }, " s", ["最近 30 分钟平均"])}</td>
+      <td>${renderMetricBrief({ current: item.queue?.base }, " m", ["基础排队长度"])}</td>
+      <td>${renderMetricBrief({ current: item.queue?.current }, " m", ["当前排队长度"])}</td>
+      <td>${renderMetricBrief({ current: item.queue?.peak }, " m", ["最近 30 分钟峰值"])}</td>
       <td>${renderSparkline(item.flow?.series || [], { label: `车道${item.lane}流量趋势` })}</td>
       <td>${renderSparkline(item.headway?.series || [], { label: `车道${item.lane}车头时距趋势`, unit: " s" })}</td>
       <td>${renderSparkline(item.queue?.series || [], { label: `车道${item.lane}排队长度趋势`, unit: " m", secondarySeries: item.queue?.smooth_series || [] })}</td>
@@ -871,11 +866,11 @@ function renderDataLogLaneTable(summary) {
       <tr>
         <th>车道</th>
         <th>更新状态</th>
-        <th>实时流量</th>
-        <th>实时车头时距</th>
-        <th>实时排队长度</th>
-        <th>排队峰值</th>
-        <th>排队判断</th>
+        <th>30分钟总流量</th>
+        <th>30分钟平均车头时距</th>
+        <th>基础排队长度</th>
+        <th>当前排队长度</th>
+        <th>30分钟峰值排队长度</th>
         <th>流量趋势</th>
         <th>车头时距趋势</th>
         <th>排队长度趋势</th>
@@ -951,8 +946,8 @@ async function loadDataLogSummary() {
   renderDataLogLaneTable(summary);
   if (meta) {
     meta.textContent = summary.latest_at
-      ? `当前展示最近 ${summary.minutes || DATA_LOG_WINDOW_MINUTES} 分钟，覆盖 ${summary.lane_count || 0} 条车道，最新一条数据时间 ${summary.latest_at}。`
-      : `当前展示最近 ${summary.minutes || DATA_LOG_WINDOW_MINUTES} 分钟，但最近还没有读取到检测数据。`;
+      ? `当前展示最近 ${summary.minutes || DATA_LOG_WINDOW_MINUTES} 分钟，覆盖 ${summary.lane_count || 0} 条车道，最新数据时间 ${summary.latest_at}。`
+      : `当前展示最近 ${summary.minutes || DATA_LOG_WINDOW_MINUTES} 分钟，等待数据更新。`;
   }
   updateDataLogAutoRefreshBadge(`自动更新中，每 ${Math.round(DATA_LOG_REFRESH_MS / 1000)} 秒刷新一次`, "ok");
 }

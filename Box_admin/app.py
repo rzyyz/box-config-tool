@@ -1126,7 +1126,7 @@ def load_base_length_summary() -> dict[str, float]:
     return result
 
 
-def read_metric_series(prefix: str, minutes: int) -> dict[str, Any]:
+def read_metric_series(prefix: str, minutes: int, aggregate_mode: str = "avg") -> dict[str, Any]:
     safe_minutes = max(1, min(int(minutes or 30), 180))
     path = latest_csv_file(prefix)
     empty = {
@@ -1139,6 +1139,7 @@ def read_metric_series(prefix: str, minutes: int) -> dict[str, Any]:
         "latest_by_lane": {},
         "peak_by_lane": {},
         "avg_by_lane": {},
+        "total_by_lane": {},
     }
     if path is None:
         return empty
@@ -1191,13 +1192,19 @@ def read_metric_series(prefix: str, minutes: int) -> dict[str, Any]:
         latest_by_lane: dict[str, float] = {}
         peak_by_lane: dict[str, float] = {}
         avg_by_lane: dict[str, float] = {}
+        total_by_lane: dict[str, float] = {}
         for lane in lanes:
             lane_values = [float(item["value"]) for item in series_by_lane[lane]]
             if not lane_values:
                 continue
             latest_by_lane[lane] = round(lane_values[-1], 2)
             peak_by_lane[lane] = round(max(lane_values), 2)
-            avg_by_lane[lane] = round(sum(lane_values) / len(lane_values), 2)
+            total_by_lane[lane] = round(sum(lane_values), 2)
+            if aggregate_mode == "avg_positive":
+                positive_values = [value for value in lane_values if value > 0]
+                avg_by_lane[lane] = round(sum(positive_values) / len(positive_values), 2) if positive_values else 0.0
+            else:
+                avg_by_lane[lane] = round(sum(lane_values) / len(lane_values), 2)
         return {
             "file": str(path),
             "minutes": safe_minutes,
@@ -1208,6 +1215,7 @@ def read_metric_series(prefix: str, minutes: int) -> dict[str, Any]:
             "latest_by_lane": latest_by_lane,
             "peak_by_lane": peak_by_lane,
             "avg_by_lane": avg_by_lane,
+            "total_by_lane": total_by_lane,
         }
     except Exception as exc:
         empty["error"] = str(exc)
@@ -1530,11 +1538,12 @@ def data_summary(minutes: int = 60) -> dict[str, Any]:
 
 def build_data_log_summary(minutes: int = 30) -> dict[str, Any]:
     safe_minutes = max(1, min(int(minutes or 30), 180))
-    flow = read_metric_series("flow", safe_minutes)
-    headway = read_metric_series("headway", safe_minutes)
+    flow = read_metric_series("flow", safe_minutes, aggregate_mode="sum")
+    headway = read_metric_series("headway", safe_minutes, aggregate_mode="avg_positive")
     queue = read_metric_series("queueLen", safe_minutes)
+    base_lengths = load_base_length_summary()
     lanes = sorted(
-        set(flow.get("lanes", [])) | set(headway.get("lanes", [])) | set(queue.get("lanes", [])),
+        set(flow.get("lanes", [])) | set(headway.get("lanes", [])) | set(queue.get("lanes", [])) | set(base_lengths.keys()),
         key=lane_sort_key,
     )
     now_ts = time.time()
@@ -1551,16 +1560,16 @@ def build_data_log_summary(minutes: int = 30) -> dict[str, Any]:
         stale_seconds = round(max(now_ts - latest_ts, 0.0), 1) if latest_ts is not None else None
         if latest_ts is None:
             freshness = "empty"
-            freshness_label = "暂无数据"
+            freshness_label = "等待数据"
         elif stale_seconds <= 20:
             freshness = "fresh"
-            freshness_label = "持续更新"
+            freshness_label = "已更新"
         elif stale_seconds <= 90:
             freshness = "lagging"
-            freshness_label = "更新变慢"
+            freshness_label = "最近更新"
         else:
             freshness = "stale"
-            freshness_label = "长时间未更新"
+            freshness_label = "等待刷新"
         queue_behavior = summarize_queue_behavior(queue_series)
         lane_items.append(
             {
@@ -1575,6 +1584,7 @@ def build_data_log_summary(minutes: int = 30) -> dict[str, Any]:
                 "freshness_label": freshness_label,
                 "flow": {
                     "current": flow.get("latest_by_lane", {}).get(lane, 0.0),
+                    "total": flow.get("total_by_lane", {}).get(lane, 0.0),
                     "peak": flow.get("peak_by_lane", {}).get(lane, 0.0),
                     "average": flow.get("avg_by_lane", {}).get(lane, 0.0),
                     "series": flow_series,
@@ -1586,6 +1596,7 @@ def build_data_log_summary(minutes: int = 30) -> dict[str, Any]:
                     "series": headway_series,
                 },
                 "queue": {
+                    "base": round(float(base_lengths.get(lane, 0.0)), 2),
                     "current": queue.get("latest_by_lane", {}).get(lane, 0.0),
                     "peak": queue.get("peak_by_lane", {}).get(lane, 0.0),
                     "average": queue.get("avg_by_lane", {}).get(lane, 0.0),
