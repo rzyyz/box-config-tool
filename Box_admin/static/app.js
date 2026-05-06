@@ -12,8 +12,8 @@ const DATA_LOG_NAV_PRIORITY = {
   camera: 1,
   calibration: 2,
   runtime: 3,
-  "step-control": 4,
-  "data-check": 5,
+  "data-check": 4,
+  "step-control": 5,
   "data-log": 6,
   "runtime-log": 7,
 };
