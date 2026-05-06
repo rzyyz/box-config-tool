@@ -10,4 +10,4 @@ Path=/home/nvidia/Project/box_config_tool/Box_admin
 Icon=preferences-system-network
 Terminal=false
 Categories=Settings;Network;
-StartupNotify=true
+StartupNotify=false
