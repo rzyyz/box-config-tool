@@ -1048,6 +1048,11 @@ def latest_csv_file(prefix: str) -> Path | None:
     return max(files, key=lambda path: path.stat().st_mtime)
 
 
+def lane_sort_key(lane: str) -> tuple[int, Any]:
+    lane_text = str(lane)
+    return (0, int(lane_text)) if lane_text.isdigit() else (1, lane_text)
+
+
 def read_csv_tail_rows(path: Path, max_lines: int = 12) -> tuple[str, list[str]]:
     with path.open("rb") as handle:
         header = handle.readline().decode("utf-8", errors="ignore").strip()
@@ -1119,6 +1124,163 @@ def load_base_length_summary() -> dict[str, float]:
         except (TypeError, ValueError):
             continue
     return result
+
+
+def read_metric_series(prefix: str, minutes: int) -> dict[str, Any]:
+    safe_minutes = max(1, min(int(minutes or 30), 180))
+    path = latest_csv_file(prefix)
+    empty = {
+        "file": str(path) if path else None,
+        "minutes": safe_minutes,
+        "lanes": [],
+        "series": {},
+        "rows": 0,
+        "updated_at": None,
+        "latest_by_lane": {},
+        "peak_by_lane": {},
+        "avg_by_lane": {},
+    }
+    if path is None:
+        return empty
+    max_lines = min(max(int(safe_minutes * 65) + 60, 800), 120000)
+    try:
+        header, data_lines = read_csv_tail_rows(path, max_lines=max_lines)
+        if not data_lines:
+            return empty
+        reader = csv.DictReader(StringIO(header + "\n" + "\n".join(data_lines) + "\n"))
+        rows = list(reader)
+        latest_ts = None
+        latest_dt = None
+        for row in reversed(rows):
+            try:
+                latest_ts = float(row.get("ts", ""))
+                latest_dt = row.get("dateTime")
+                break
+            except (TypeError, ValueError):
+                continue
+        if latest_ts is None:
+            return empty
+        start_ts = latest_ts - safe_minutes * 60
+        series_by_lane: dict[str, list[dict[str, Any]]] = {}
+        used_rows = 0
+        for row in rows:
+            try:
+                row_ts = float(row.get("ts", ""))
+            except (TypeError, ValueError):
+                continue
+            if row_ts < start_ts:
+                continue
+            used_rows += 1
+            row_label = str(row.get("dateTime") or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row_ts)))
+            for key, value in row.items():
+                if not key.startswith("lane_"):
+                    continue
+                lane = key.replace("lane_", "")
+                try:
+                    metric_value = round(float(value or 0.0), 2)
+                except (TypeError, ValueError):
+                    continue
+                series_by_lane.setdefault(lane, []).append(
+                    {
+                        "ts": round(row_ts, 3),
+                        "label": row_label,
+                        "value": metric_value,
+                    }
+                )
+        lanes = sorted(series_by_lane.keys(), key=lane_sort_key)
+        latest_by_lane: dict[str, float] = {}
+        peak_by_lane: dict[str, float] = {}
+        avg_by_lane: dict[str, float] = {}
+        for lane in lanes:
+            lane_values = [float(item["value"]) for item in series_by_lane[lane]]
+            if not lane_values:
+                continue
+            latest_by_lane[lane] = round(lane_values[-1], 2)
+            peak_by_lane[lane] = round(max(lane_values), 2)
+            avg_by_lane[lane] = round(sum(lane_values) / len(lane_values), 2)
+        return {
+            "file": str(path),
+            "minutes": safe_minutes,
+            "lanes": lanes,
+            "series": series_by_lane,
+            "rows": used_rows,
+            "updated_at": latest_dt,
+            "latest_by_lane": latest_by_lane,
+            "peak_by_lane": peak_by_lane,
+            "avg_by_lane": avg_by_lane,
+        }
+    except Exception as exc:
+        empty["error"] = str(exc)
+        return empty
+
+
+def moving_average(values: list[float], window: int = 5) -> list[float]:
+    if not values:
+        return []
+    safe_window = max(1, int(window or 1))
+    result: list[float] = []
+    running = 0.0
+    for index, value in enumerate(values):
+        running += value
+        if index >= safe_window:
+            running -= values[index - safe_window]
+        count = min(index + 1, safe_window)
+        result.append(round(running / count, 2))
+    return result
+
+
+def summarize_queue_behavior(series: list[dict[str, Any]]) -> dict[str, Any]:
+    if not series:
+        return {
+            "trend": "no_data",
+            "trend_label": "暂无数据",
+            "note": "最近 30 分钟还没有排队长度记录。",
+            "swing": 0.0,
+            "delta": 0.0,
+            "smooth_series": [],
+        }
+    values = [round(float(item.get("value", 0.0)), 2) for item in series]
+    smooth_values = moving_average(values, window=5)
+    smooth_series = [
+        {
+            "ts": series[index]["ts"],
+            "label": series[index]["label"],
+            "value": smooth_values[index],
+        }
+        for index in range(len(series))
+    ]
+    lookback = min(len(smooth_values), 120)
+    recent_smooth = smooth_values[-lookback:] if lookback else smooth_values
+    recent_raw = values[-lookback:] if lookback else values
+    first_value = recent_smooth[0] if recent_smooth else 0.0
+    last_value = recent_smooth[-1] if recent_smooth else 0.0
+    delta = round(last_value - first_value, 2)
+    swing = round((max(recent_raw) - min(recent_raw)) if recent_raw else 0.0, 2)
+    noisy = swing > max(3.0, abs(delta) * 1.8 + 2.0)
+    if delta >= 2.0:
+        trend = "rising"
+        trend_label = "缓慢上升" if not noisy else "整体上升但波动偏大"
+        note = "排队长度最近整体在上升，通常说明车辆在持续积压。"
+        if noisy:
+            note = "排队长度虽然整体上升，但抖动偏大，建议核对排队区、停止线或车辆框是否稳定。"
+    elif delta <= -2.0:
+        trend = "falling"
+        trend_label = "明显回落"
+        note = "排队长度明显回落，通常表示车辆开始放行。"
+    else:
+        trend = "steady"
+        trend_label = "基本持平" if not noisy else "总体持平但有抖动"
+        note = "排队长度大体持平，说明当前排队规模变化不大。"
+        if noisy:
+            note = "排队长度总体没有明显涨跌，但瞬时波动偏大，建议结合现场画面再看一眼。"
+    return {
+        "trend": trend,
+        "trend_label": trend_label,
+        "note": note,
+        "swing": swing,
+        "delta": delta,
+        "smooth_series": smooth_series,
+    }
 
 
 def read_metric_window(prefix: str, minutes: int, mode: str) -> dict[str, Any]:
@@ -1205,9 +1367,6 @@ def read_recent_lane_metrics_summary(minutes: int = 3) -> dict[str, Any]:
     queue = read_metric_window("queueLen", safe_minutes, mode="avg")
     base_lengths = load_base_length_summary()
 
-    def lane_sort_key(lane: str) -> tuple[int, Any]:
-        return (0, int(lane)) if lane.isdigit() else (1, lane)
-
     lanes = sorted(
         set(flow.get("lanes", [])) | set(headway.get("lanes", [])) | set(queue.get("lanes", [])) | set(base_lengths.keys()),
         key=lane_sort_key,
@@ -1281,9 +1440,6 @@ def read_flow_window_summary(minutes: int) -> dict[str, Any]:
                     sums[lane] = sums.get(lane, 0.0) + float(value or 0)
                 except (TypeError, ValueError):
                     continue
-
-        def lane_sort_key(lane: str) -> tuple[int, Any]:
-            return (0, int(lane)) if lane.isdigit() else (1, lane)
 
         lanes = sorted(sums.keys(), key=lane_sort_key)
         by_lane = {lane: round(sums[lane], 2) for lane in lanes}
@@ -1369,6 +1525,94 @@ def data_summary(minutes: int = 60) -> dict[str, Any]:
         "latest_metrics_3m": read_recent_lane_metrics_summary(3),
         "flow_window": read_flow_window_summary(minutes),
         "recent_events": read_recent_log_events(),
+    }
+
+
+def build_data_log_summary(minutes: int = 30) -> dict[str, Any]:
+    safe_minutes = max(1, min(int(minutes or 30), 180))
+    flow = read_metric_series("flow", safe_minutes)
+    headway = read_metric_series("headway", safe_minutes)
+    queue = read_metric_series("queueLen", safe_minutes)
+    lanes = sorted(
+        set(flow.get("lanes", [])) | set(headway.get("lanes", [])) | set(queue.get("lanes", [])),
+        key=lane_sort_key,
+    )
+    now_ts = time.time()
+    lane_items: list[dict[str, Any]] = []
+    latest_timestamps: list[float] = []
+    for lane in lanes:
+        flow_series = list(flow.get("series", {}).get(lane, []))
+        headway_series = list(headway.get("series", {}).get(lane, []))
+        queue_series = list(queue.get("series", {}).get(lane, []))
+        latest_candidates = [series[-1]["ts"] for series in (flow_series, headway_series, queue_series) if series]
+        latest_ts = max(latest_candidates) if latest_candidates else None
+        if latest_ts is not None:
+            latest_timestamps.append(latest_ts)
+        stale_seconds = round(max(now_ts - latest_ts, 0.0), 1) if latest_ts is not None else None
+        if latest_ts is None:
+            freshness = "empty"
+            freshness_label = "暂无数据"
+        elif stale_seconds <= 20:
+            freshness = "fresh"
+            freshness_label = "持续更新"
+        elif stale_seconds <= 90:
+            freshness = "lagging"
+            freshness_label = "更新变慢"
+        else:
+            freshness = "stale"
+            freshness_label = "长时间未更新"
+        queue_behavior = summarize_queue_behavior(queue_series)
+        lane_items.append(
+            {
+                "lane": lane,
+                "latest_at": queue_series[-1]["label"] if queue_series else (
+                    headway_series[-1]["label"] if headway_series else (
+                        flow_series[-1]["label"] if flow_series else None
+                    )
+                ),
+                "stale_seconds": stale_seconds,
+                "freshness": freshness,
+                "freshness_label": freshness_label,
+                "flow": {
+                    "current": flow.get("latest_by_lane", {}).get(lane, 0.0),
+                    "peak": flow.get("peak_by_lane", {}).get(lane, 0.0),
+                    "average": flow.get("avg_by_lane", {}).get(lane, 0.0),
+                    "series": flow_series,
+                },
+                "headway": {
+                    "current": headway.get("latest_by_lane", {}).get(lane, 0.0),
+                    "peak": headway.get("peak_by_lane", {}).get(lane, 0.0),
+                    "average": headway.get("avg_by_lane", {}).get(lane, 0.0),
+                    "series": headway_series,
+                },
+                "queue": {
+                    "current": queue.get("latest_by_lane", {}).get(lane, 0.0),
+                    "peak": queue.get("peak_by_lane", {}).get(lane, 0.0),
+                    "average": queue.get("avg_by_lane", {}).get(lane, 0.0),
+                    "series": queue_series,
+                    "smooth_series": queue_behavior["smooth_series"],
+                    "trend": queue_behavior["trend"],
+                    "trend_label": queue_behavior["trend_label"],
+                    "trend_note": queue_behavior["note"],
+                    "swing": queue_behavior["swing"],
+                    "delta": queue_behavior["delta"],
+                },
+            }
+        )
+    latest_at = None
+    if latest_timestamps:
+        latest_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(max(latest_timestamps)))
+    return {
+        "minutes": safe_minutes,
+        "latest_at": latest_at,
+        "server_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts)),
+        "lane_count": len(lane_items),
+        "source_files": {
+            "flow": flow.get("file"),
+            "headway": headway.get("file"),
+            "queue": queue.get("file"),
+        },
+        "lanes": lane_items,
     }
 
 
@@ -1657,6 +1901,18 @@ def api_data_summary():
     if not (1 <= minutes <= 1440):
         return jsonify({"ok": False, "message": "统计分钟数必须在 1 到 1440 之间"}), 400
     return jsonify({"ok": True, "summary": data_summary(minutes)})
+
+
+@app.get("/api/data-log")
+def api_data_log():
+    raw_minutes = request.args.get("minutes", "30")
+    try:
+        minutes = int(raw_minutes)
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "message": "数据日志时长必须是整数分钟"}), 400
+    if not (1 <= minutes <= 180):
+        return jsonify({"ok": False, "message": "数据日志时长必须在 1 到 180 分钟之间"}), 400
+    return jsonify({"ok": True, "summary": build_data_log_summary(minutes)})
 
 
 @app.get("/api/signal-controller")

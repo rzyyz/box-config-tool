@@ -444,6 +444,109 @@ input:focus, select:focus {
   color: #fecaca;
 }
 
+.insight-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.insight-item {
+  display: grid;
+  gap: 6px;
+  padding: 14px;
+  border-radius: 14px;
+  border: 1px solid var(--line);
+  background: rgba(15, 23, 42, 0.54);
+}
+
+.insight-item strong {
+  color: #fff6e7;
+  font-size: 14px;
+}
+
+.status-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.badge.info {
+  color: #cfe8ff;
+  background: rgba(14, 165, 233, 0.12);
+}
+
+.badge.dim {
+  color: var(--muted);
+  background: rgba(148, 163, 184, 0.08);
+}
+
+.sparkline-box {
+  min-width: 180px;
+}
+
+.sparkline {
+  width: 180px;
+  height: 56px;
+  display: block;
+}
+
+.sparkline .grid-line {
+  stroke: rgba(148, 163, 184, 0.14);
+  stroke-width: 1;
+}
+
+.sparkline .line-primary {
+  fill: none;
+  stroke: #38bdf8;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.sparkline .line-secondary {
+  fill: none;
+  stroke: #f59e0b;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.sparkline .area-primary {
+  fill: rgba(56, 189, 248, 0.12);
+}
+
+.sparkline-meta {
+  margin-top: 6px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.trend-note {
+  min-width: 220px;
+}
+
+.trend-note strong {
+  display: block;
+  margin-bottom: 6px;
+  color: #fff6e7;
+  font-size: 14px;
+}
+
+.metric-brief {
+  display: grid;
+  gap: 4px;
+  min-width: 110px;
+}
+
+.metric-brief .value {
+  font-size: 18px;
+  color: #fff;
+}
+
+.metric-brief .subtle {
+  font-size: 12px;
+}
+
 @media (max-width: 1100px) {
   .workspace {
     grid-template-columns: 1fr;
@@ -458,5 +561,13 @@ input:focus, select:focus {
   .card-grid.three,
   .field-grid {
     grid-template-columns: 1fr;
+  }
+
+  .sparkline-box {
+    min-width: 150px;
+  }
+
+  .sparkline {
+    width: 150px;
   }
 }

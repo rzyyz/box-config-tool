@@ -285,6 +285,52 @@
             <pre id="recentEvents" class="log-box">暂无异常日志</pre>
           </article>
         </section>
+
+        <section class="page-panel" data-page-key="data-log" data-page-title="数据日志">
+          <div class="section-head">
+            <h2>数据日志</h2>
+            <p>用于现场盯实时检测参数是否合理。页面会持续更新，只展示最近 30 分钟，便于快速判断识别结果、排队长度和车头时距是否正常。</p>
+          </div>
+          <div class="card-grid two">
+            <article class="card">
+              <div class="section-toolbar">
+                <div>
+                  <h3>实时窗口</h3>
+                  <div id="dataLogMeta" class="subtle">进入页面后将自动加载最近 30 分钟数据。</div>
+                </div>
+                <div class="actions">
+                  <span id="dataLogAutoRefreshText" class="badge warn">自动更新准备中</span>
+                </div>
+              </div>
+              <div id="dataLogStatusCards" class="status-cards"></div>
+            </article>
+            <article class="card">
+              <h3>排队长度怎么看</h3>
+              <div class="insight-stack">
+                <div class="insight-item">
+                  <strong>蓝线</strong>
+                  <span>表示当前秒的实际检测值，允许有一点小抖动。</span>
+                </div>
+                <div class="insight-item">
+                  <strong>金线</strong>
+                  <span>表示平滑后的趋势，更适合看整体是在上升、持平还是回落。</span>
+                </div>
+                <div class="insight-item">
+                  <strong>现场判断</strong>
+                  <span>红灯积压时通常会缓慢上升或持平，波动不应太大；绿灯放行后才会明显回落。</span>
+                </div>
+              </div>
+            </article>
+          </div>
+          <article class="card">
+            <div class="section-toolbar">
+              <div class="subtle">每条车道同时展示流量、车头时距和排队长度趋势。排队长度图中蓝线是实时值，金线是平滑趋势。</div>
+            </div>
+            <div class="table-wrap">
+              <table id="dataLogLaneTable" class="data-table compact-table"></table>
+            </div>
+          </article>
+        </section>
       </main>
     </div>
   </div>

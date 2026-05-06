@@ -4,6 +4,9 @@ const navRoot = document.getElementById("sidebarNav");
 const htmlCache = new Map();
 const loadedPages = new Set();
 let activePageKey = panels.find((panel) => panel.classList.contains("active"))?.dataset.pageKey || "network";
+let dataLogRefreshTimer = null;
+const DATA_LOG_WINDOW_MINUTES = 30;
+const DATA_LOG_REFRESH_MS = 5000;
 const CTRL_MODE_LABELS = {
   0: "本地时段控制",
   1: "关灯控制",
@@ -100,6 +103,7 @@ async function activatePage(key) {
   } catch (error) {
     showToast(error.message, false);
   }
+  syncLiveRefreshForPage(key);
 }
 
 
@@ -697,6 +701,192 @@ function renderRecentEvents(events) {
 }
 
 
+function metricNumber(value, digits = 2) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return "-";
+  }
+  return Number.isInteger(num) ? String(num) : num.toFixed(digits);
+}
+
+
+function freshnessBadge(status, label) {
+  const cls = {
+    fresh: "ok",
+    lagging: "warn",
+    stale: "err",
+    empty: "dim",
+  }[status] || "dim";
+  return `<span class="badge ${cls}">${escapeHtml(label || "暂无数据")}</span>`;
+}
+
+
+function updateDataLogAutoRefreshBadge(message, status = "warn") {
+  const root = document.getElementById("dataLogAutoRefreshText");
+  if (!root) {
+    return;
+  }
+  root.className = `badge ${status}`;
+  root.textContent = message;
+}
+
+
+function buildSparklinePoints(series, width = 180, height = 56, padding = 5, scale = null) {
+  const safeSeries = Array.isArray(series) ? series.filter((item) => Number.isFinite(Number(item?.value))) : [];
+  if (!safeSeries.length) {
+    return { polyline: "", area: "", min: 0, max: 0 };
+  }
+  if (safeSeries.length === 1) {
+    const x = width / 2;
+    const y = height / 2;
+    return {
+      polyline: `${x},${y} ${x + 0.01},${y}`,
+      area: `${padding},${height - padding} ${x},${y} ${width - padding},${height - padding}`,
+      min: safeSeries[0].value,
+      max: safeSeries[0].value,
+    };
+  }
+  const values = safeSeries.map((item) => Number(item.value));
+  const min = Number.isFinite(scale?.min) ? Number(scale.min) : Math.min(...values);
+  const max = Number.isFinite(scale?.max) ? Number(scale.max) : Math.max(...values);
+  const range = max - min || 1;
+  const points = safeSeries.map((item, index) => {
+    const x = padding + (index * (width - padding * 2)) / Math.max(safeSeries.length - 1, 1);
+    const y = height - padding - ((Number(item.value) - min) / range) * (height - padding * 2);
+    return `${x.toFixed(2)},${y.toFixed(2)}`;
+  });
+  const area = [
+    `${padding},${height - padding}`,
+    ...points,
+    `${width - padding},${height - padding}`,
+  ].join(" ");
+  return {
+    polyline: points.join(" "),
+    area,
+    min,
+    max,
+  };
+}
+
+
+function renderSparkline(series, options = {}) {
+  const width = options.width || 180;
+  const height = options.height || 56;
+  const secondarySeries = Array.isArray(options.secondarySeries) ? options.secondarySeries : [];
+  const allValues = [...(series || []), ...secondarySeries]
+    .map((item) => Number(item?.value))
+    .filter((value) => Number.isFinite(value));
+  const sharedScale = allValues.length
+    ? { min: Math.min(...allValues), max: Math.max(...allValues) }
+    : null;
+  const primary = buildSparklinePoints(series, width, height, 5, sharedScale);
+  if (!primary.polyline) {
+    return `<div class="sparkline-box"><div class="subtle">暂无趋势</div></div>`;
+  }
+  const secondary = buildSparklinePoints(secondarySeries, width, height, 5, sharedScale);
+  const minValue = metricNumber(primary.min);
+  const maxValue = metricNumber(primary.max);
+  return `
+    <div class="sparkline-box">
+      <svg class="sparkline" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(options.label || "趋势图")}">
+        <line class="grid-line" x1="0" y1="${height / 2}" x2="${width}" y2="${height / 2}"></line>
+        <polygon class="area-primary" points="${primary.area}"></polygon>
+        <polyline class="line-primary" points="${primary.polyline}"></polyline>
+        ${secondary.polyline ? `<polyline class="line-secondary" points="${secondary.polyline}"></polyline>` : ""}
+      </svg>
+      <div class="sparkline-meta">最低 ${minValue}${options.unit || ""} / 最高 ${maxValue}${options.unit || ""}</div>
+    </div>
+  `;
+}
+
+
+function renderDataLogStatusCards(summary) {
+  const root = document.getElementById("dataLogStatusCards");
+  const cards = [
+    { label: "观察窗口", value: `最近 ${summary.minutes || DATA_LOG_WINDOW_MINUTES} 分钟` },
+    { label: "最近数据时间", value: summary.latest_at || "最近还没有检测数据" },
+    { label: "当前车道数", value: String(summary.lane_count || 0) },
+    { label: "页面刷新", value: `打开本页后每 ${Math.round(DATA_LOG_REFRESH_MS / 1000)} 秒自动更新` },
+  ];
+  setHtmlIfChanged(root, cards.map((item) => `
+    <div class="status-card">
+      <span class="label">${item.label}</span>
+      <span class="value">${escapeHtml(item.value)}</span>
+    </div>
+  `).join(""));
+}
+
+
+function renderMetricBrief(metric, unit = "") {
+  return `
+    <div class="metric-brief">
+      <span class="value">${metricNumber(metric?.current)}${unit}</span>
+      <span class="subtle">30分钟峰值 ${metricNumber(metric?.peak)}${unit}</span>
+      <span class="subtle">30分钟均值 ${metricNumber(metric?.average)}${unit}</span>
+    </div>
+  `;
+}
+
+
+function renderDataLogLaneTable(summary) {
+  const root = document.getElementById("dataLogLaneTable");
+  const lanes = Array.isArray(summary?.lanes) ? summary.lanes : [];
+  if (!lanes.length) {
+    setHtmlIfChanged(root, `<tbody><tr><td>最近 30 分钟没有可展示的检测数据。</td></tr></tbody>`);
+    return;
+  }
+  const rows = lanes.map((item) => `
+    <tr>
+      <td>
+        <strong>车道 ${escapeHtml(item.lane)}</strong>
+        <div class="subtle">${escapeHtml(item.latest_at || "暂无时间")}</div>
+      </td>
+      <td>
+        <div class="status-inline">
+          ${freshnessBadge(item.freshness, item.freshness_label)}
+        </div>
+        <div class="subtle">${item.stale_seconds == null ? "暂无新样本" : `${metricNumber(item.stale_seconds, 1)} 秒前更新`}</div>
+      </td>
+      <td>${renderMetricBrief(item.flow, "")}</td>
+      <td>${renderMetricBrief(item.headway, " s")}</td>
+      <td>${renderMetricBrief(item.queue, " m")}</td>
+      <td>
+        <div class="metric-brief">
+          <span class="value">${metricNumber(item.queue?.peak)} m</span>
+          <span class="subtle">最近变化 ${metricNumber(item.queue?.delta)} m</span>
+          <span class="subtle">波动范围 ${metricNumber(item.queue?.swing)} m</span>
+        </div>
+      </td>
+      <td class="trend-note">
+        <strong>${escapeHtml(item.queue?.trend_label || "暂无判断")}</strong>
+        <div class="subtle">${escapeHtml(item.queue?.trend_note || "最近暂无排队数据。")}</div>
+      </td>
+      <td>${renderSparkline(item.flow?.series || [], { label: `车道${item.lane}流量趋势` })}</td>
+      <td>${renderSparkline(item.headway?.series || [], { label: `车道${item.lane}车头时距趋势`, unit: " s" })}</td>
+      <td>${renderSparkline(item.queue?.series || [], { label: `车道${item.lane}排队长度趋势`, unit: " m", secondarySeries: item.queue?.smooth_series || [] })}</td>
+    </tr>
+  `).join("");
+  const html = `
+    <thead>
+      <tr>
+        <th>车道</th>
+        <th>更新状态</th>
+        <th>实时流量</th>
+        <th>实时车头时距</th>
+        <th>实时排队长度</th>
+        <th>排队峰值</th>
+        <th>排队判断</th>
+        <th>流量趋势</th>
+        <th>车头时距趋势</th>
+        <th>排队长度趋势</th>
+      </tr>
+    </thead>
+    <tbody>${rows}</tbody>
+  `;
+  setHtmlIfChanged(root, html);
+}
+
+
 async function loadStatus() {
   const data = await fetchJson("/api/status");
   renderNetworkSummary(data);
@@ -752,8 +942,64 @@ async function loadDataSummary() {
 }
 
 
+async function loadDataLogSummary() {
+  updateDataLogAutoRefreshBadge("数据日志更新中", "warn");
+  const data = await fetchJson(`/api/data-log?minutes=${encodeURIComponent(DATA_LOG_WINDOW_MINUTES)}`);
+  const summary = data.summary || {};
+  const meta = document.getElementById("dataLogMeta");
+  renderDataLogStatusCards(summary);
+  renderDataLogLaneTable(summary);
+  if (meta) {
+    meta.textContent = summary.latest_at
+      ? `当前展示最近 ${summary.minutes || DATA_LOG_WINDOW_MINUTES} 分钟，覆盖 ${summary.lane_count || 0} 条车道，最新一条数据时间 ${summary.latest_at}。`
+      : `当前展示最近 ${summary.minutes || DATA_LOG_WINDOW_MINUTES} 分钟，但最近还没有读取到检测数据。`;
+  }
+  updateDataLogAutoRefreshBadge(`自动更新中，每 ${Math.round(DATA_LOG_REFRESH_MS / 1000)} 秒刷新一次`, "ok");
+}
+
+
+function stopDataLogAutoRefresh() {
+  if (dataLogRefreshTimer) {
+    clearInterval(dataLogRefreshTimer);
+    dataLogRefreshTimer = null;
+  }
+  if (activePageKey !== "data-log") {
+    updateDataLogAutoRefreshBadge("离开本页后暂停自动更新", "dim");
+  }
+}
+
+
+function startDataLogAutoRefresh() {
+  stopDataLogAutoRefresh();
+  if (activePageKey !== "data-log") {
+    return;
+  }
+  dataLogRefreshTimer = setInterval(async () => {
+    if (activePageKey !== "data-log") {
+      stopDataLogAutoRefresh();
+      return;
+    }
+    try {
+      await loadDataLogSummary();
+    } catch (error) {
+      updateDataLogAutoRefreshBadge("自动更新失败，等待下一轮重试", "err");
+      showToast(error.message, false);
+    }
+  }, DATA_LOG_REFRESH_MS);
+}
+
+
+function syncLiveRefreshForPage(key) {
+  if (key === "data-log") {
+    startDataLogAutoRefresh();
+    return;
+  }
+  stopDataLogAutoRefresh();
+}
+
+
 async function loadPageData(key, force = false) {
-  if (!force && loadedPages.has(key)) {
+  if (!force && loadedPages.has(key) && key !== "data-log") {
     return;
   }
   if (key === "network") {
@@ -773,6 +1019,8 @@ async function loadPageData(key, force = false) {
     } else {
       renderRecentEvents([]);
     }
+  } else if (key === "data-log") {
+    await loadDataLogSummary();
   }
   loadedPages.add(key);
 }
@@ -1123,6 +1371,7 @@ async function boot() {
   } catch (error) {
     showToast(error.message, false);
   }
+  syncLiveRefreshForPage(activePageKey);
 }
 
 
