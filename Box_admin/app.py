@@ -1062,9 +1062,34 @@ def latest_csv_file(prefix: str) -> Path | None:
     return max(files, key=lambda path: path.stat().st_mtime)
 
 
+def list_metric_csv_files(prefix: str) -> list[Path]:
+    files = [path for path in TRAFFIC_QUEUE_DIR.glob(f"{prefix}_*.csv") if ".bak" not in path.name]
+    return sorted(files, key=lambda path: (path.stat().st_mtime, path.name))
+
+
 def lane_sort_key(lane: str) -> tuple[int, Any]:
     lane_text = str(lane)
     return (0, int(lane_text)) if lane_text.isdigit() else (1, lane_text)
+
+
+def parse_local_datetime_minute(value: str, field_name: str) -> float:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError(f"{field_name}不能为空")
+    try:
+        parsed = time.strptime(text, "%Y-%m-%dT%H:%M")
+    except ValueError as exc:
+        raise ValueError(f"{field_name}格式不正确，请按分钟选择时间") from exc
+    return float(time.mktime(parsed))
+
+
+def format_local_datetime_minute(ts_value: float | int | None) -> str | None:
+    if ts_value is None:
+        return None
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts_value)))
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 def read_csv_tail_rows(path: Path, max_lines: int = 12) -> tuple[str, list[str]]:
@@ -1234,6 +1259,128 @@ def read_metric_series(prefix: str, minutes: int, aggregate_mode: str = "avg") -
     except Exception as exc:
         empty["error"] = str(exc)
         return empty
+
+
+def read_metric_rows_between(prefix: str, start_ts: float, end_ts: float) -> dict[str, Any]:
+    files = list_metric_csv_files(prefix)
+    payload = {
+        "files": [],
+        "fieldnames": [],
+        "rows": [],
+        "updated_at": None,
+    }
+    if not files:
+        return payload
+    collected: list[tuple[float, dict[str, str]]] = []
+    fieldnames: list[str] = []
+    latest_row_ts: float | None = None
+    latest_row_label: str | None = None
+    for path in files:
+        used_file = False
+        try:
+            with path.open("r", encoding="utf-8", errors="ignore", newline="") as handle:
+                reader = csv.DictReader(handle)
+                if reader.fieldnames and not fieldnames:
+                    fieldnames = list(reader.fieldnames)
+                for row in reader:
+                    try:
+                        row_ts = float(row.get("ts", ""))
+                    except (TypeError, ValueError):
+                        continue
+                    if row_ts < start_ts or row_ts > end_ts:
+                        continue
+                    used_file = True
+                    collected.append((row_ts, dict(row)))
+                    if latest_row_ts is None or row_ts >= latest_row_ts:
+                        latest_row_ts = row_ts
+                        latest_row_label = row.get("dateTime")
+        except Exception:
+            continue
+        if used_file:
+            payload["files"].append(str(path))
+    collected.sort(key=lambda item: item[0])
+    payload["fieldnames"] = fieldnames
+    payload["rows"] = [row for _, row in collected]
+    payload["updated_at"] = latest_row_label
+    return payload
+
+
+def build_metric_series_payload(
+    prefix: str,
+    rows: list[dict[str, str]],
+    *,
+    start_ts: float,
+    end_ts: float,
+    aggregate_mode: str = "avg",
+    source_files: list[str] | None = None,
+    updated_at: str | None = None,
+) -> dict[str, Any]:
+    minutes = max(1, round(max(end_ts - start_ts, 0.0) / 60))
+    payload = {
+        "file": source_files[0] if source_files else None,
+        "files": list(source_files or []),
+        "minutes": minutes,
+        "lanes": [],
+        "series": {},
+        "rows": 0,
+        "updated_at": updated_at,
+        "latest_by_lane": {},
+        "peak_by_lane": {},
+        "avg_by_lane": {},
+        "total_by_lane": {},
+    }
+    series_by_lane: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        try:
+            row_ts = float(row.get("ts", ""))
+        except (TypeError, ValueError):
+            continue
+        row_label = str(row.get("dateTime") or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(row_ts)))
+        for key, value in row.items():
+            if not key.startswith("lane_"):
+                continue
+            lane = key.replace("lane_", "")
+            try:
+                metric_value = round(float(value or 0.0), 2)
+            except (TypeError, ValueError):
+                continue
+            series_by_lane.setdefault(lane, []).append(
+                {
+                    "ts": round(row_ts, 3),
+                    "label": row_label,
+                    "value": metric_value,
+                }
+            )
+    lanes = sorted(series_by_lane.keys(), key=lane_sort_key)
+    payload["lanes"] = lanes
+    payload["series"] = series_by_lane
+    payload["rows"] = len(rows)
+    for lane in lanes:
+        lane_values = [float(item["value"]) for item in series_by_lane[lane]]
+        if not lane_values:
+            continue
+        payload["latest_by_lane"][lane] = round(lane_values[-1], 2)
+        payload["peak_by_lane"][lane] = round(max(lane_values), 2)
+        payload["total_by_lane"][lane] = round(sum(lane_values), 2)
+        if aggregate_mode == "avg_positive":
+            positive_values = [value for value in lane_values if value > 0]
+            payload["avg_by_lane"][lane] = round(sum(positive_values) / len(positive_values), 2) if positive_values else 0.0
+        else:
+            payload["avg_by_lane"][lane] = round(sum(lane_values) / len(lane_values), 2)
+    return payload
+
+
+def read_metric_series_between(prefix: str, start_ts: float, end_ts: float, aggregate_mode: str = "avg") -> dict[str, Any]:
+    rows_payload = read_metric_rows_between(prefix, start_ts, end_ts)
+    return build_metric_series_payload(
+        prefix,
+        rows_payload["rows"],
+        start_ts=start_ts,
+        end_ts=end_ts,
+        aggregate_mode=aggregate_mode,
+        source_files=rows_payload["files"],
+        updated_at=rows_payload["updated_at"],
+    )
 
 
 def moving_average(values: list[float], window: int = 5) -> list[float]:
@@ -1964,11 +2111,16 @@ def data_summary(minutes: int = 60) -> dict[str, Any]:
     }
 
 
-def build_data_log_summary(minutes: int = 30) -> dict[str, Any]:
-    safe_minutes = max(1, min(int(minutes or 30), 180))
-    flow = read_metric_series("flow", safe_minutes, aggregate_mode="sum")
-    headway = read_metric_series("headway", safe_minutes, aggregate_mode="avg_positive")
-    queue = read_metric_series("queueLen", safe_minutes)
+def build_data_log_summary_payload(
+    flow: dict[str, Any],
+    headway: dict[str, Any],
+    queue: dict[str, Any],
+    *,
+    window_minutes: int,
+    window_label: str,
+    start_at: str | None = None,
+    end_at: str | None = None,
+) -> dict[str, Any]:
     base_lengths = load_base_length_summary()
     lanes = sorted(
         set(flow.get("lanes", [])) | set(headway.get("lanes", [])) | set(queue.get("lanes", [])) | set(base_lengths.keys()),
@@ -1998,7 +2150,6 @@ def build_data_log_summary(minutes: int = 30) -> dict[str, Any]:
         else:
             freshness = "stale"
             freshness_label = "等待刷新"
-        queue_behavior = summarize_queue_behavior(queue_series)
         lane_items.append(
             {
                 "lane": lane,
@@ -2029,12 +2180,7 @@ def build_data_log_summary(minutes: int = 30) -> dict[str, Any]:
                     "peak": queue.get("peak_by_lane", {}).get(lane, 0.0),
                     "average": queue.get("avg_by_lane", {}).get(lane, 0.0),
                     "series": queue_series,
-                    "smooth_series": queue_behavior["smooth_series"],
-                    "trend": queue_behavior["trend"],
-                    "trend_label": queue_behavior["trend_label"],
-                    "trend_note": queue_behavior["note"],
-                    "swing": queue_behavior["swing"],
-                    "delta": queue_behavior["delta"],
+                    "smooth_series": summarize_queue_behavior(queue_series)["smooth_series"],
                 },
             }
         )
@@ -2042,16 +2188,145 @@ def build_data_log_summary(minutes: int = 30) -> dict[str, Any]:
     if latest_timestamps:
         latest_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(max(latest_timestamps)))
     return {
-        "minutes": safe_minutes,
+        "minutes": window_minutes,
+        "window_label": window_label,
+        "start_at": start_at,
+        "end_at": end_at,
         "latest_at": latest_at,
         "server_time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now_ts)),
         "lane_count": len(lane_items),
         "source_files": {
-            "flow": flow.get("file"),
-            "headway": headway.get("file"),
-            "queue": queue.get("file"),
+            "flow": flow.get("files") or ([flow.get("file")] if flow.get("file") else []),
+            "headway": headway.get("files") or ([headway.get("file")] if headway.get("file") else []),
+            "queue": queue.get("files") or ([queue.get("file")] if queue.get("file") else []),
         },
         "lanes": lane_items,
+    }
+
+
+def build_data_log_summary(minutes: int = 30) -> dict[str, Any]:
+    safe_minutes = max(1, min(int(minutes or 30), 180))
+    flow = read_metric_series("flow", safe_minutes, aggregate_mode="sum")
+    headway = read_metric_series("headway", safe_minutes, aggregate_mode="avg_positive")
+    queue = read_metric_series("queueLen", safe_minutes)
+    return build_data_log_summary_payload(
+        flow,
+        headway,
+        queue,
+        window_minutes=safe_minutes,
+        window_label=f"最近 {safe_minutes} 分钟",
+    )
+
+
+def validate_data_log_range(start_text: str, end_text: str) -> tuple[float, float, str, str]:
+    start_raw_ts = parse_local_datetime_minute(start_text, "开始时间")
+    end_raw_ts = parse_local_datetime_minute(end_text, "结束时间")
+    if end_raw_ts < start_raw_ts:
+        raise ValueError("结束时间不能早于开始时间")
+    max_minutes = 7 * 24 * 60
+    if end_raw_ts - start_raw_ts > max_minutes * 60:
+        raise ValueError("单次查询时段不能超过 7 天")
+    return (
+        start_raw_ts,
+        end_raw_ts + 59.999,
+        format_local_datetime_minute(start_raw_ts) or "",
+        format_local_datetime_minute(end_raw_ts) or "",
+    )
+
+
+def build_data_log_range_summary(start_ts: float, end_ts: float, start_label: str, end_label: str) -> dict[str, Any]:
+    flow = read_metric_series_between("flow", start_ts, end_ts, aggregate_mode="sum")
+    headway = read_metric_series_between("headway", start_ts, end_ts, aggregate_mode="avg_positive")
+    queue = read_metric_series_between("queueLen", start_ts, end_ts)
+    return build_data_log_range_summary_from_metrics(flow, headway, queue, start_ts, end_ts, start_label, end_label)
+
+
+def build_data_log_range_summary_from_metrics(
+    flow: dict[str, Any],
+    headway: dict[str, Any],
+    queue: dict[str, Any],
+    start_ts: float,
+    end_ts: float,
+    start_label: str,
+    end_label: str,
+) -> dict[str, Any]:
+    return build_data_log_summary_payload(
+        flow,
+        headway,
+        queue,
+        window_minutes=max(1, round(max(end_ts - start_ts, 0.0) / 60)),
+        window_label=f"{start_label} 至 {end_label}",
+        start_at=start_label,
+        end_at=end_label,
+    )
+
+
+def write_metric_rows_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> None:
+    safe_fieldnames = list(fieldnames or [])
+    if not safe_fieldnames:
+        safe_fieldnames = ["ts", "dateTime"]
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=safe_fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({key: row.get(key, "") for key in safe_fieldnames})
+
+
+def export_data_log_range_bundle(start_ts: float, end_ts: float, start_label: str, end_label: str) -> dict[str, Any]:
+    RELEASE_DIR.mkdir(parents=True, exist_ok=True)
+    flow_rows = read_metric_rows_between("flow", start_ts, end_ts)
+    headway_rows = read_metric_rows_between("headway", start_ts, end_ts)
+    queue_rows = read_metric_rows_between("queueLen", start_ts, end_ts)
+    flow = build_metric_series_payload(
+        "flow",
+        flow_rows["rows"],
+        start_ts=start_ts,
+        end_ts=end_ts,
+        aggregate_mode="sum",
+        source_files=flow_rows["files"],
+        updated_at=flow_rows["updated_at"],
+    )
+    headway = build_metric_series_payload(
+        "headway",
+        headway_rows["rows"],
+        start_ts=start_ts,
+        end_ts=end_ts,
+        aggregate_mode="avg_positive",
+        source_files=headway_rows["files"],
+        updated_at=headway_rows["updated_at"],
+    )
+    queue = build_metric_series_payload(
+        "queueLen",
+        queue_rows["rows"],
+        start_ts=start_ts,
+        end_ts=end_ts,
+        aggregate_mode="avg",
+        source_files=queue_rows["files"],
+        updated_at=queue_rows["updated_at"],
+    )
+    summary = build_data_log_range_summary_from_metrics(flow, headway, queue, start_ts, end_ts, start_label, end_label)
+    bundle_token = f"{time.strftime('%Y%m%d_%H%M', time.localtime(start_ts))}_{time.strftime('%Y%m%d_%H%M', time.localtime(end_ts))}"
+    bundle_name = f"data_log_{bundle_token}.tar.gz"
+    bundle_path = RELEASE_DIR / bundle_name
+    staging_dir = RELEASE_DIR / f".data_log_export_{uuid.uuid4().hex}"
+    export_root = staging_dir / "data_log_export"
+    data_dir = export_root / "csv"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        summary_path = export_root / "summary.json"
+        summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+        write_metric_rows_csv(data_dir / "flow.csv", flow_rows["fieldnames"], flow_rows["rows"])
+        write_metric_rows_csv(data_dir / "headway.csv", headway_rows["fieldnames"], headway_rows["rows"])
+        write_metric_rows_csv(data_dir / "queueLen.csv", queue_rows["fieldnames"], queue_rows["rows"])
+        with tarfile.open(bundle_path, "w:gz") as tar:
+            tar.add(export_root, arcname="data_log_export")
+    finally:
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    return {
+        "message": f"已导出 {start_label} 至 {end_label} 的数据日志",
+        "filename": bundle_name,
+        "download_url": f"/api/data-log/download/{bundle_name}",
+        "summary": summary,
     }
 
 
@@ -2352,6 +2627,46 @@ def api_data_log():
     if not (1 <= minutes <= 180):
         return jsonify({"ok": False, "message": "数据日志时长必须在 1 到 180 分钟之间"}), 400
     return jsonify({"ok": True, "summary": build_data_log_summary(minutes)})
+
+
+@app.get("/api/data-log/range")
+def api_data_log_range():
+    try:
+        start_ts, end_ts, start_label, end_label = validate_data_log_range(
+            request.args.get("start", ""),
+            request.args.get("end", ""),
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+    return jsonify({"ok": True, "summary": build_data_log_range_summary(start_ts, end_ts, start_label, end_label)})
+
+
+@app.post("/api/data-log/export")
+def api_data_log_export():
+    body = request.get_json(silent=True) or {}
+    try:
+        start_ts, end_ts, start_label, end_label = validate_data_log_range(
+            body.get("start", ""),
+            body.get("end", ""),
+        )
+    except ValueError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+    try:
+        payload = export_data_log_range_bundle(start_ts, end_ts, start_label, end_label)
+    except RuntimeError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 500
+    return jsonify({"ok": True, **payload})
+
+
+@app.get("/api/data-log/download/<path:filename>")
+def api_data_log_download(filename: str):
+    safe_name = Path(filename).name
+    if not re.fullmatch(r"data_log_[A-Za-z0-9_\-]+\.tar\.gz", safe_name):
+        return jsonify({"ok": False, "message": "导出文件名无效"}), 400
+    bundle_path = RELEASE_DIR / safe_name
+    if not bundle_path.exists() or not bundle_path.is_file():
+        return jsonify({"ok": False, "message": "导出文件不存在，请重新导出"}), 404
+    return send_file(bundle_path, as_attachment=True, download_name=safe_name)
 
 
 @app.get("/api/runtime-diagnostics")

@@ -7,6 +7,16 @@ let activePageKey = panels.find((panel) => panel.classList.contains("active"))?.
 let dataLogRefreshTimer = null;
 const DATA_LOG_WINDOW_MINUTES = 30;
 const DATA_LOG_REFRESH_MS = 5000;
+const DATA_LOG_NAV_PRIORITY = {
+  network: 0,
+  camera: 1,
+  calibration: 2,
+  runtime: 3,
+  "step-control": 4,
+  "data-check": 5,
+  "data-log": 6,
+  "runtime-log": 7,
+};
 const CTRL_MODE_LABELS = {
   0: "本地时段控制",
   1: "关灯控制",
@@ -110,11 +120,10 @@ async function activatePage(key) {
 function buildNavigation() {
   navRoot.innerHTML = "";
   const orderedPanels = panels.slice().sort((a, b) => {
-    if (a.dataset.pageKey === "data-check") {
-      return b.dataset.pageKey === "step-control" ? -1 : 1;
-    }
-    if (b.dataset.pageKey === "data-check") {
-      return a.dataset.pageKey === "step-control" ? 1 : -1;
+    const aOrder = DATA_LOG_NAV_PRIORITY[a.dataset.pageKey] ?? panels.indexOf(a);
+    const bOrder = DATA_LOG_NAV_PRIORITY[b.dataset.pageKey] ?? panels.indexOf(b);
+    if (aOrder !== bOrder) {
+      return aOrder - bOrder;
     }
     return panels.indexOf(a) - panels.indexOf(b);
   });
@@ -804,6 +813,28 @@ function metricNumber(value, digits = 2) {
 }
 
 
+function toDatetimeLocalValue(date) {
+  const safeDate = date instanceof Date ? date : new Date(date);
+  if (Number.isNaN(safeDate.getTime())) {
+    return "";
+  }
+  const year = safeDate.getFullYear();
+  const month = String(safeDate.getMonth() + 1).padStart(2, "0");
+  const day = String(safeDate.getDate()).padStart(2, "0");
+  const hours = String(safeDate.getHours()).padStart(2, "0");
+  const minutes = String(safeDate.getMinutes()).padStart(2, "0");
+  return `${year}-${month}-${day}T${hours}:${minutes}`;
+}
+
+
+function describeDataLogWindow(summary) {
+  if (summary?.window_label) {
+    return summary.window_label;
+  }
+  return `最近 ${summary?.minutes || DATA_LOG_WINDOW_MINUTES} 分钟`;
+}
+
+
 function freshnessBadge(status, label) {
   const cls = {
     fresh: "ok",
@@ -897,7 +928,7 @@ function renderSparkline(series, options = {}) {
 function renderDataLogStatusCards(summary) {
   const root = document.getElementById("dataLogStatusCards");
   const cards = [
-    { label: "观察窗口", value: `最近 ${summary.minutes || DATA_LOG_WINDOW_MINUTES} 分钟` },
+    { label: "观察窗口", value: describeDataLogWindow(summary) },
     { label: "最近数据时间", value: summary.latest_at || "等待数据更新" },
     { label: "当前车道数", value: String(summary.lane_count || 0) },
     { label: "页面刷新", value: `打开本页后每 ${Math.round(DATA_LOG_REFRESH_MS / 1000)} 秒自动更新` },
@@ -921,11 +952,12 @@ function renderMetricBrief(metric, unit = "", extraLines = []) {
 }
 
 
-function renderDataLogLaneTable(summary) {
-  const root = document.getElementById("dataLogLaneTable");
+function renderDataLogLaneTable(summary, rootId = "dataLogLaneTable") {
+  const root = document.getElementById(rootId);
   const lanes = Array.isArray(summary?.lanes) ? summary.lanes : [];
+  const windowLabel = describeDataLogWindow(summary);
   if (!lanes.length) {
-    setHtmlIfChanged(root, `<tbody><tr><td>最近 30 分钟没有可展示的检测数据。</td></tr></tbody>`);
+    setHtmlIfChanged(root, `<tbody><tr><td>${escapeHtml(windowLabel)}没有可展示的检测数据。</td></tr></tbody>`);
     return;
   }
   const rows = lanes.map((item) => `
@@ -943,13 +975,13 @@ function renderDataLogLaneTable(summary) {
       <td>
         <div class="metric-brief">
           <span class="value">${metricNumber(item.flow?.total)}</span>
-          <span class="subtle">最近 30 分钟累计</span>
+          <span class="subtle">${escapeHtml(windowLabel)}累计</span>
         </div>
       </td>
-      <td>${renderMetricBrief({ current: item.headway?.average }, " s", ["最近 30 分钟平均"])}</td>
+      <td>${renderMetricBrief({ current: item.headway?.average }, " s", [`${windowLabel}平均`])}</td>
       <td>${renderMetricBrief({ current: item.queue?.base }, " m", ["基础排队长度"])}</td>
       <td>${renderMetricBrief({ current: item.queue?.current }, " m", ["当前排队长度"])}</td>
-      <td>${renderMetricBrief({ current: item.queue?.peak }, " m", ["最近 30 分钟峰值"])}</td>
+      <td>${renderMetricBrief({ current: item.queue?.peak }, " m", [`${windowLabel}峰值`])}</td>
       <td>${renderSparkline(item.flow?.series || [], { label: `车道${item.lane}流量趋势` })}</td>
       <td>${renderSparkline(item.headway?.series || [], { label: `车道${item.lane}车头时距趋势`, unit: " s" })}</td>
       <td>${renderSparkline(item.queue?.series || [], { label: `车道${item.lane}排队长度趋势`, unit: " m", secondarySeries: item.queue?.smooth_series || [] })}</td>
@@ -960,11 +992,11 @@ function renderDataLogLaneTable(summary) {
       <tr>
         <th>车道</th>
         <th>更新状态</th>
-        <th>30分钟总流量</th>
-        <th>30分钟平均车头时距</th>
+        <th>${escapeHtml(windowLabel)}总流量</th>
+        <th>${escapeHtml(windowLabel)}平均车头时距</th>
         <th>基础排队长度</th>
         <th>当前排队长度</th>
-        <th>30分钟峰值排队长度</th>
+        <th>${escapeHtml(windowLabel)}峰值排队长度</th>
         <th>流量趋势</th>
         <th>车头时距趋势</th>
         <th>排队长度趋势</th>
@@ -1047,6 +1079,50 @@ async function loadDataLogSummary() {
 }
 
 
+function ensureDataLogRangeDefaults() {
+  const startInput = document.getElementById("dataLogRangeStart");
+  const endInput = document.getElementById("dataLogRangeEnd");
+  if (!startInput || !endInput) {
+    return;
+  }
+  const now = new Date();
+  now.setSeconds(0, 0);
+  const start = new Date(now.getTime() - DATA_LOG_WINDOW_MINUTES * 60 * 1000);
+  if (!endInput.value) {
+    endInput.value = toDatetimeLocalValue(now);
+  }
+  if (!startInput.value) {
+    startInput.value = toDatetimeLocalValue(start);
+  }
+}
+
+
+function getDataLogRangeSelection() {
+  return {
+    start: document.getElementById("dataLogRangeStart")?.value || "",
+    end: document.getElementById("dataLogRangeEnd")?.value || "",
+  };
+}
+
+
+async function loadDataLogRangeSummary(showSuccess = false) {
+  ensureDataLogRangeDefaults();
+  const { start, end } = getDataLogRangeSelection();
+  const data = await fetchJson(`/api/data-log/range?start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}`);
+  const summary = data.summary || {};
+  const meta = document.getElementById("dataLogRangeMeta");
+  renderDataLogLaneTable(summary, "dataLogRangeTable");
+  if (meta) {
+    meta.textContent = summary.latest_at
+      ? `当前展示 ${describeDataLogWindow(summary)}，覆盖 ${summary.lane_count || 0} 条车道，最近数据时间 ${summary.latest_at}。`
+      : `当前展示 ${describeDataLogWindow(summary)}，该时段暂无可展示数据。`;
+  }
+  if (showSuccess) {
+    showToast("已查询所选时段数据", true);
+  }
+}
+
+
 async function loadRuntimeDiagnostics() {
   const data = await fetchJson("/api/runtime-diagnostics");
   const summary = data.summary || {};
@@ -1125,6 +1201,7 @@ async function loadPageData(key, force = false) {
     }
   } else if (key === "data-log") {
     await loadDataLogSummary();
+    await loadDataLogRangeSummary();
   }
   loadedPages.add(key);
 }
@@ -1245,6 +1322,38 @@ function wireActions() {
       await loadRuntimeDiagnostics();
       window.open(data.download_url, "_blank", "noopener,noreferrer");
       showToast(data.message || "最近运行日志已导出", true);
+    } catch (error) {
+      showToast(error.message, false);
+    } finally {
+      button.disabled = false;
+      button.textContent = previousText;
+    }
+  });
+
+  document.getElementById("queryDataLogRangeBtn").addEventListener("click", async () => {
+    clearToast();
+    try {
+      await loadDataLogRangeSummary(true);
+    } catch (error) {
+      showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("exportDataLogRangeBtn").addEventListener("click", async () => {
+    clearToast();
+    const button = document.getElementById("exportDataLogRangeBtn");
+    const previousText = button.textContent;
+    button.disabled = true;
+    button.textContent = "导出中...";
+    try {
+      ensureDataLogRangeDefaults();
+      const data = await fetchJson("/api/data-log/export", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(getDataLogRangeSelection()),
+      });
+      window.open(data.download_url, "_blank", "noopener,noreferrer");
+      showToast(data.message || "已导出所选时段数据", true);
     } catch (error) {
       showToast(error.message, false);
     } finally {
@@ -1498,6 +1607,7 @@ function wireActions() {
 
 
 async function boot() {
+  ensureDataLogRangeDefaults();
   buildNavigation();
   wireActions();
   try {

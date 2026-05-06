@@ -328,6 +328,30 @@ input:focus, select:focus {
   margin-bottom: 12px;
 }
 
+.inline-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.inline-field input {
+  width: 88px;
+}
+
+.compact-field {
+  min-width: 210px;
+}
+
+.data-log-range-toolbar {
+  align-items: flex-start;
+}
+
+.data-log-range-actions {
+  align-items: flex-end;
+  flex-wrap: wrap;
+}
+
 .subtle {
   color: var(--muted);
   font-size: 13px;

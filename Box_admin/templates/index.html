@@ -316,7 +316,7 @@
         <section class="page-panel" data-page-key="data-log" data-page-title="数据日志">
           <div class="section-head">
             <h2>数据日志</h2>
-            <p>展示最近 30 分钟的检测数据，页面会持续更新，便于现场确认识别正在正常进行。</p>
+            <p>展示最近数据，并支持按指定时段查询和导出，便于现场确认检测正在正常进行。</p>
           </div>
           <div class="card-grid two">
             <article class="card">
@@ -332,19 +332,22 @@
               <div id="dataLogStatusCards" class="status-cards"></div>
             </article>
             <article class="card">
-              <h3>数据展示</h3>
-              <div class="insight-stack">
-                <div class="insight-item">
-                  <strong>流量</strong>
-                  <span>显示最近 30 分钟各车道累计流量。</span>
+              <div class="section-toolbar data-log-range-toolbar">
+                <div>
+                  <h3>按时间段查询</h3>
+                  <div id="dataLogRangeMeta" class="subtle">选择开始和结束时间后，可查询并导出该时段数据。</div>
                 </div>
-                <div class="insight-item">
-                  <strong>车头时距</strong>
-                  <span>显示最近 30 分钟所有有效车头时距的平均值。</span>
-                </div>
-                <div class="insight-item">
-                  <strong>排队长度</strong>
-                  <span>同时展示基础排队长度、当前排队长度和最近 30 分钟峰值。</span>
+                <div class="actions data-log-range-actions">
+                  <label class="field compact-field">
+                    <span>开始时间</span>
+                    <input id="dataLogRangeStart" type="datetime-local" step="60">
+                  </label>
+                  <label class="field compact-field">
+                    <span>结束时间</span>
+                    <input id="dataLogRangeEnd" type="datetime-local" step="60">
+                  </label>
+                  <button id="queryDataLogRangeBtn" class="btn secondary">查询该时段</button>
+                  <button id="exportDataLogRangeBtn" class="btn primary">导出该时段数据</button>
                 </div>
               </div>
             </article>
@@ -355,6 +358,14 @@
             </div>
             <div class="table-wrap">
               <table id="dataLogLaneTable" class="data-table compact-table"></table>
+            </div>
+          </article>
+          <article class="card">
+            <div class="section-toolbar">
+              <div class="subtle">按时间段查询后，可查看该时段每条车道的累计数据，并导出原始 CSV。</div>
+            </div>
+            <div class="table-wrap">
+              <table id="dataLogRangeTable" class="data-table compact-table"></table>
             </div>
           </article>
         </section>
