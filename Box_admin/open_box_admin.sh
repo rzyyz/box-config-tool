@@ -8,6 +8,7 @@ STATUS_URL="${APP_URL%/}/api/status"
 LOCK_DIR="/tmp/box_admin_open.lock"
 STAMP_FILE="/tmp/box_admin_open.last"
 RECENT_LAUNCH_SECONDS="${BOX_ADMIN_RECENT_LAUNCH_SECONDS:-8}"
+CHROMIUM_LIGHT_FLAGS="${BOX_ADMIN_CHROMIUM_LIGHT_FLAGS:---process-per-site --renderer-process-limit=2 --disable-background-networking --disable-sync --disable-features=BackForwardCache,Translate,TFLiteLanguageDetectionEnabled --disk-cache-size=1 --media-cache-size=1}"
 
 cleanup() {
   rmdir "$LOCK_DIR" >/dev/null 2>&1 || true
@@ -56,13 +57,17 @@ open_browser() {
 
   for browser in epiphany-browser google-chrome google-chrome-stable; do
     if command -v "$browser" >/dev/null 2>&1 || [ -x "$browser" ]; then
-      "$browser" "$APP_URL" >/dev/null 2>&1 &
+      if [ "$browser" = "epiphany-browser" ]; then
+        "$browser" "$APP_URL" >/dev/null 2>&1 &
+      else
+        "$browser" $CHROMIUM_LIGHT_FLAGS "$APP_URL" >/dev/null 2>&1 &
+      fi
       return 0
     fi
   done
 
   if command -v snap >/dev/null 2>&1 && snap list chromium >/dev/null 2>&1; then
-    snap run chromium "$APP_URL" >/dev/null 2>&1 &
+    snap run chromium $CHROMIUM_LIGHT_FLAGS "$APP_URL" >/dev/null 2>&1 &
     return 0
   fi
 

@@ -11,7 +11,12 @@ Environment=HOME=/home/nvidia
 Environment=BOX_CONFIG_LOG_ROOT=/home/nvidia/Project/box_config_tool/logs
 ExecStart=/bin/bash /home/nvidia/Project/box_config_tool/Traffic_detect/start.sh
 Restart=on-failure
-RestartSec=5
+RestartSec=8
+Nice=5
+OOMScoreAdjust=300
+KillMode=control-group
+TimeoutStopSec=20
+LimitNOFILE=65536
 
 # Safety note:
 # The installer disables autostart by default. Enable this service only after
