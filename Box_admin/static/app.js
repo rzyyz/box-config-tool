@@ -1010,7 +1010,7 @@ function renderSparkline(series, options = {}) {
         <polyline class="line-primary" points="${primary.polyline}"></polyline>
         ${secondary.polyline ? `<polyline class="line-secondary" points="${secondary.polyline}"></polyline>` : ""}
       </svg>
-      <div class="sparkline-meta">每 5 秒 1 个点，已平滑。最低 ${minValue}${options.unit || ""} / 最高 ${maxValue}${options.unit || ""}</div>
+      <div class="sparkline-meta">每 5 秒 1 个点。最低 ${minValue}${options.unit || ""} / 最高 ${maxValue}${options.unit || ""}</div>
       ${axisLabels ? `
         <div class="sparkline-axis">
           <span>${escapeHtml(shortTimeLabel(axisLabels.start))}</span>
