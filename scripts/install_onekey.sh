@@ -18,9 +18,18 @@ MINIFORGE_INSTALLER="${MINIFORGE_INSTALLER:-}"
 ENABLE_AUTOSTART="${ENABLE_AUTOSTART:-1}"
 START_SERVICES="${START_SERVICES:-1}"
 START_TRAFFIC="${START_TRAFFIC:-1}"
-INSTALL_DAILY_REBOOT="${INSTALL_DAILY_REBOOT:-0}"
+INSTALL_DAILY_REBOOT="${INSTALL_DAILY_REBOOT:-1}"
 INSTALL_DESKTOP_ICON="${INSTALL_DESKTOP_ICON:-1}"
 INSTALL_CHROMIUM_OFFLINE="${INSTALL_CHROMIUM_OFFLINE:-1}"
+INSTALL_BROWSER_FALLBACK="${INSTALL_BROWSER_FALLBACK:-1}"
+INSTALL_EPIPHANY_OFFLINE="${INSTALL_EPIPHANY_OFFLINE:-1}"
+BROWSER_AUTO_INSTALL_APT="${BROWSER_AUTO_INSTALL_APT:-0}"
+INSTALL_PREPLAN_CONTROL="${INSTALL_PREPLAN_CONTROL:-1}"
+START_PREPLAN="${START_PREPLAN:-1}"
+ENABLE_TRAFFIC_AUTOSTART="${ENABLE_TRAFFIC_AUTOSTART:-1}"
+ENABLE_PREPLAN_AUTOSTART="${ENABLE_PREPLAN_AUTOSTART:-1}"
+PREPLAN_INSTALL_OFFLINE_JAVA="${PREPLAN_INSTALL_OFFLINE_JAVA:-1}"
+PREPLAN_AUTO_INSTALL_JAVA="${PREPLAN_AUTO_INSTALL_JAVA:-0}"
 PIP_WHEEL_DIR="${PIP_WHEEL_DIR:-}"
 REQUIRED_IMPORTS=("flask" "fastapi" "uvicorn" "flask_cors")
 REQUIRED_PIP_PACKAGES=("flask" "fastapi" "uvicorn" "flask-cors")
@@ -38,6 +47,34 @@ die() {
 
 need_file() {
   [ -e "$1" ] || die "missing required path: $1"
+}
+
+fix_text_line_endings() {
+  log "normalizing text line endings under ${PROJECT_ROOT}"
+  find "$PROJECT_ROOT" \
+    -path "${PROJECT_ROOT}/.git" -prune -o \
+    -path "${PROJECT_ROOT}/__pycache__" -prune -o \
+    -type f \
+    \( \
+      -name '*.sh' -o \
+      -name '*.service' -o \
+      -name '*.timer' -o \
+      -name '*.py' -o \
+      -name '*.txt' -o \
+      -name '*.md' -o \
+      -name '*.env' -o \
+      -name '*.desktop' \
+    \) \
+    ! -name 'Miniforge3-Linux-aarch64.sh' \
+    ! -name '*.whl' \
+    ! -name '*.snap' \
+    ! -name '*.deb' \
+    ! -name '*.jar' \
+    ! -name '*.engine' \
+    ! -name '*.onnx' \
+    ! -name '*.pt' \
+    -print0 \
+    | xargs -0 -r sed -i 's/\r$//'
 }
 
 prepare_project_root() {
@@ -61,6 +98,8 @@ prepare_project_root() {
     PROJECT_ROOT="$TARGET_PROJECT_ROOT"
     SCRIPT_DIR="${PROJECT_ROOT}/scripts"
   fi
+
+  fix_text_line_endings
 }
 
 require_project_layout() {
@@ -103,6 +142,13 @@ install_miniforge_if_needed() {
   if [ -x "${CONDA_HOME}/bin/conda" ]; then
     log "Miniforge already exists: ${CONDA_HOME}"
     return 0
+  fi
+
+  if [ -e "${CONDA_HOME}" ]; then
+    local backup_path
+    backup_path="${CONDA_HOME}.broken_$(date +%Y%m%d_%H%M%S)"
+    log "found incomplete Miniforge at ${CONDA_HOME}; moving it to ${backup_path}"
+    mv "${CONDA_HOME}" "${backup_path}"
   fi
 
   local installer="${MINIFORGE_INSTALLER:-${PROJECT_ROOT}/Miniforge3-Linux-aarch64.sh}"
@@ -204,10 +250,75 @@ install_chromium_offline_if_requested() {
 
   if [ -s "${PROJECT_ROOT}/offline_browser/snaps/chromium_3318.snap" ] || [ -s "${PROJECT_ROOT}/offline_browser/browser_snaps_export/chromium_3318.snap" ]; then
     log "installing Chromium from local offline snap packages"
-    bash "${PROJECT_ROOT}/scripts/install_chromium_offline.sh" || die "offline Chromium install failed"
+    if ! bash "${PROJECT_ROOT}/scripts/install_chromium_offline.sh"; then
+      log "offline Chromium install failed; continuing with browser fallback checks"
+    fi
   else
     log "offline Chromium snap packages not prepared; skipping Chromium install"
   fi
+}
+
+set_default_browser_epiphany() {
+  local desktop_id=""
+  local runtime_dir=""
+
+  for candidate in /usr/share/applications/org.gnome.Epiphany.desktop /usr/share/applications/epiphany.desktop; do
+    if [ -f "$candidate" ]; then
+      desktop_id="$(basename "$candidate")"
+      break
+    fi
+  done
+
+  [ -n "$desktop_id" ] || return 0
+
+  runtime_dir="/run/user/$(id -u "$SERVICE_USER")"
+  sudo -u "$SERVICE_USER" \
+    env DISPLAY=:0 \
+        XAUTHORITY="${SERVICE_HOME}/.Xauthority" \
+        XDG_RUNTIME_DIR="${runtime_dir}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=${runtime_dir}/bus" \
+        xdg-settings set default-web-browser "$desktop_id" >/dev/null 2>&1 || true
+}
+
+ensure_local_browser_fallback() {
+  [ "$INSTALL_BROWSER_FALLBACK" = "1" ] || {
+    log "INSTALL_BROWSER_FALLBACK=0, skipping local browser fallback"
+    return 0
+  }
+
+  if command -v epiphany-browser >/dev/null 2>&1; then
+    log "local browser fallback already available: epiphany-browser"
+    set_default_browser_epiphany
+    return 0
+  fi
+
+  if [ "$INSTALL_EPIPHANY_OFFLINE" = "1" ] && [ -d "${PROJECT_ROOT}/offline_browser/epiphany_debs" ]; then
+    log "installing local browser fallback from offline epiphany deb packages"
+    if bash "${PROJECT_ROOT}/scripts/install_epiphany_offline.sh"; then
+      set_default_browser_epiphany
+      return 0
+    fi
+    log "offline epiphany-browser install failed"
+  fi
+
+  if [ "$BROWSER_AUTO_INSTALL_APT" != "1" ]; then
+    log "BROWSER_AUTO_INSTALL_APT=0, skipping online epiphany-browser install"
+    return 0
+  fi
+
+  if ! command -v apt-get >/dev/null 2>&1; then
+    log "apt-get not found; cannot install local browser fallback"
+    return 0
+  fi
+
+  log "installing local browser fallback: epiphany-browser"
+  if sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y epiphany-browser; then
+    set_default_browser_epiphany
+    return 0
+  fi
+
+  log "failed to install epiphany-browser; local browser fallback not available"
+  return 0
 }
 
 install_sudoers() {
@@ -218,6 +329,7 @@ install_sudoers() {
 ${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start traffic_detect.service, /usr/bin/systemctl stop traffic_detect.service, /usr/bin/systemctl restart traffic_detect.service, /usr/bin/systemctl enable traffic_detect.service, /usr/bin/systemctl disable traffic_detect.service
 ${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start config_agent.service, /usr/bin/systemctl stop config_agent.service, /usr/bin/systemctl restart config_agent.service, /usr/bin/systemctl enable config_agent.service, /usr/bin/systemctl disable config_agent.service
 ${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start box_admin.service, /usr/bin/systemctl stop box_admin.service, /usr/bin/systemctl restart box_admin.service, /usr/bin/systemctl enable box_admin.service, /usr/bin/systemctl disable box_admin.service
+${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/systemctl start preplan-control.service, /usr/bin/systemctl stop preplan-control.service, /usr/bin/systemctl restart preplan-control.service, /usr/bin/systemctl enable preplan-control.service, /usr/bin/systemctl disable preplan-control.service
 ${SERVICE_USER} ALL=(root) NOPASSWD: /usr/bin/nmcli connection modify *, /usr/bin/nmcli connection up *
 EOF
 
@@ -229,7 +341,8 @@ EOF
 
 install_services() {
   log "installing systemd services"
-  PROJECT_ROOT="$PROJECT_ROOT" SERVICE_USER="$SERVICE_USER" SERVICE_HOME="$SERVICE_HOME" INSTALL_DAILY_REBOOT=0 \
+  PROJECT_ROOT="$PROJECT_ROOT" SERVICE_USER="$SERVICE_USER" SERVICE_HOME="$SERVICE_HOME" INSTALL_DAILY_REBOOT=0 INSTALL_PREPLAN_CONTROL="$INSTALL_PREPLAN_CONTROL" PREPLAN_AUTO_INSTALL_JAVA="$PREPLAN_AUTO_INSTALL_JAVA" \
+    PREPLAN_INSTALL_OFFLINE_JAVA="$PREPLAN_INSTALL_OFFLINE_JAVA" \
     bash "${PROJECT_ROOT}/scripts/install_manual_services.sh"
 
   for service in box_admin.service config_agent.service traffic_detect.service; do
@@ -265,13 +378,29 @@ EOF
 
 configure_autostart() {
   if [ "$ENABLE_AUTOSTART" = "1" ]; then
-    log "enabling project services at boot"
+    log "enabling light project services at boot"
     sudo systemctl enable box_admin.service
     sudo systemctl enable config_agent.service
-    sudo systemctl enable traffic_detect.service
+    if [ "$ENABLE_TRAFFIC_AUTOSTART" = "1" ]; then
+      sudo systemctl enable traffic_detect.service
+    else
+      sudo systemctl disable traffic_detect.service || true
+      log "ENABLE_TRAFFIC_AUTOSTART=0, traffic_detect.service will not start at boot"
+    fi
+    if systemctl cat preplan-control.service >/dev/null 2>&1; then
+      if [ "$ENABLE_PREPLAN_AUTOSTART" = "1" ]; then
+        sudo systemctl enable preplan-control.service
+      else
+        sudo systemctl disable preplan-control.service || true
+        log "ENABLE_PREPLAN_AUTOSTART=0, preplan-control.service will not start at boot"
+      fi
+    fi
   else
     log "ENABLE_AUTOSTART=0, services will remain disabled at boot"
     sudo systemctl disable box_admin.service config_agent.service traffic_detect.service || true
+    if systemctl cat preplan-control.service >/dev/null 2>&1; then
+      sudo systemctl disable preplan-control.service || true
+    fi
   fi
 
   if [ "$INSTALL_DAILY_REBOOT" = "1" ]; then
@@ -321,6 +450,15 @@ start_services() {
   else
     log "START_TRAFFIC=0, traffic_detect.service is installed but not started"
   fi
+
+  if systemctl cat preplan-control.service >/dev/null 2>&1; then
+    if [ "$START_PREPLAN" = "1" ]; then
+      log "starting preplan-control.service"
+      sudo systemctl restart preplan-control.service
+    else
+      log "START_PREPLAN=0, preplan-control.service is installed but not started"
+    fi
+  fi
 }
 
 verify_install() {
@@ -328,11 +466,17 @@ verify_install() {
   systemctl is-enabled box_admin.service || true
   systemctl is-enabled config_agent.service || true
   systemctl is-enabled traffic_detect.service || true
+  if systemctl cat preplan-control.service >/dev/null 2>&1; then
+    systemctl is-enabled preplan-control.service || true
+  fi
 
   log "service active state:"
   systemctl is-active box_admin.service || true
   systemctl is-active config_agent.service || true
   systemctl is-active traffic_detect.service || true
+  if systemctl cat preplan-control.service >/dev/null 2>&1; then
+    systemctl is-active preplan-control.service || true
+  fi
 
   if command -v curl >/dev/null 2>&1; then
     curl -fsS --max-time 5 http://127.0.0.1:8090/api/status >/dev/null \
@@ -351,6 +495,7 @@ main() {
   select_or_create_conda_env
   ensure_python_packages
   install_chromium_offline_if_requested
+  ensure_local_browser_fallback
   install_sudoers
   install_services
   configure_autostart
