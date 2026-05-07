@@ -9,9 +9,12 @@ import shutil
 import shlex
 import socket
 import subprocess
+import sys
 import tarfile
+import threading
 import time
 import uuid
+import hashlib
 from io import StringIO
 from collections import deque
 from pathlib import Path
@@ -135,6 +138,58 @@ DIAGNOSTIC_SERVICES = [
     "traffic_detect.service",
     "preplan-control.service",
 ]
+BATCH_UPDATE_CONFIG_DIR = BASE_DIR / "config"
+BATCH_UPDATE_TARGETS_PATH = BATCH_UPDATE_CONFIG_DIR / "batch_update_targets.json"
+BATCH_UPDATE_STATE_DIR = PROJECT_LOG_ROOT / "batch_update"
+BATCH_UPDATE_RESULTS_DIR = RELEASE_DIR / "batch_update"
+HEAVY_SERVICES = ["traffic_detect.service", "preplan-control.service"]
+BATCH_UPDATE_FILE_GROUPS = [
+    {
+        "id": "box-admin-core",
+        "label": "配置工具与主控更新器",
+        "description": "自动检查配置工具和主控更新器相关源码文件的差异并增量同步。",
+        "include_files": [
+            "Box_admin/app.py",
+            "Box_admin/open_box_admin.sh",
+            "Box_admin/box_admin.desktop",
+        ],
+        "include_dirs": [
+            "Box_admin/templates",
+            "Box_admin/static",
+        ],
+        "exclude_dir_names": ["config", "__pycache__"],
+        "exclude_file_substrings": [".bak_", ".tmp", "~"],
+    },
+    {
+        "id": "traffic-recovery",
+        "label": "感知恢复与安装脚本",
+        "description": "自动检查感知恢复、低内存策略和安装脚本的变化。",
+        "include_files": [
+            "Traffic_detect/watchdog_main.py",
+            "Traffic_detect/start.sh",
+            "Traffic_detect/traffic_detect.service.example",
+            "scripts/install_preplan_control_service.sh",
+            "scripts/apply_4g_low_memory_profile.sh",
+            "scripts/install_onekey.sh",
+        ],
+        "exclude_dir_names": ["config", "__pycache__"],
+        "exclude_file_substrings": [".bak_", ".tmp", "~"],
+    },
+    {
+        "id": "preplan-runtime",
+        "label": "智能控制服务目录",
+        "description": "自动同步 preplan-control-server 下除配置和运行产物外的所有变更文件，包含 jar 包。",
+        "include_dirs": [
+            "preplan-control-server",
+            "test/preplan-control-server",
+        ],
+        "exclude_dir_names": ["config", "logs", "__pycache__"],
+        "exclude_file_suffixes": [".log"],
+        "exclude_file_substrings": [".bak_", ".tmp", "~"],
+    },
+]
+_BATCH_UPDATE_LOCK = threading.Lock()
+_BATCH_UPDATE_TASK: dict[str, Any] | None = None
 
 app = Flask(__name__, template_folder="templates", static_folder="static")
 
@@ -144,6 +199,179 @@ def log_line(message: str) -> None:
     with LOG_PATH.open("a", encoding="utf-8") as handle:
         handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
 
+
+def ensure_batch_update_dirs() -> None:
+    BATCH_UPDATE_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    BATCH_UPDATE_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    BATCH_UPDATE_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def read_json_file(path: Path, default: Any) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except json.JSONDecodeError:
+        return default
+
+
+def write_json_file(path: Path, payload: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def batch_update_target_template() -> dict[str, Any]:
+    return {
+        "id": uuid.uuid4().hex[:12],
+        "name": "",
+        "host": "",
+        "port": 22,
+        "username": "nvidia",
+        "password": "",
+        "enabled": True,
+        "group": "",
+        "remark": "",
+    }
+
+
+def normalize_batch_update_target(raw: dict[str, Any]) -> dict[str, Any]:
+    target = batch_update_target_template()
+    target.update(
+        {
+            "id": str(raw.get("id") or target["id"]).strip(),
+            "name": str(raw.get("name") or "").strip(),
+            "host": str(raw.get("host") or "").strip(),
+            "port": int(raw.get("port") or 22),
+            "username": str(raw.get("username") or "nvidia").strip() or "nvidia",
+            "password": str(raw.get("password") or ""),
+            "enabled": bool(raw.get("enabled", True)),
+            "group": str(raw.get("group") or "").strip(),
+            "remark": str(raw.get("remark") or "").strip(),
+        }
+    )
+    return target
+
+
+def load_batch_update_targets() -> list[dict[str, Any]]:
+    ensure_batch_update_dirs()
+    raw_items = read_json_file(BATCH_UPDATE_TARGETS_PATH, {"targets": []}).get("targets", [])
+    targets = [normalize_batch_update_target(item) for item in raw_items if isinstance(item, dict)]
+    if not targets:
+        targets = [batch_update_target_template()]
+    return targets
+
+
+def save_batch_update_targets(targets: list[dict[str, Any]]) -> None:
+    normalized = [normalize_batch_update_target(item) for item in targets if isinstance(item, dict)]
+    write_json_file(BATCH_UPDATE_TARGETS_PATH, {"targets": normalized, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
+
+
+def should_include_batch_update_path(rel_path: str, rule: dict[str, Any]) -> bool:
+    parts = [part for part in rel_path.replace("\\", "/").split("/") if part]
+    excluded_names = set(rule.get("exclude_dir_names") or [])
+    if any(part in excluded_names for part in parts[:-1]):
+        return False
+    suffixes = tuple(rule.get("exclude_file_suffixes") or [])
+    if suffixes and rel_path.endswith(suffixes):
+        return False
+    substrings = tuple(rule.get("exclude_file_substrings") or [])
+    if substrings and any(token in rel_path for token in substrings):
+        return False
+    return True
+
+
+def iter_batch_update_rule_files(rule: dict[str, Any]) -> list[dict[str, Any]]:
+    files: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for rel_path in rule.get("include_files") or []:
+        rel_norm = str(rel_path or "").replace("\\", "/").strip().lstrip("/")
+        if not rel_norm or rel_norm in seen:
+            continue
+        local_path = PROJECT_ROOT / rel_norm
+        if local_path.exists() and local_path.is_file() and should_include_batch_update_path(rel_norm, rule):
+            files.append({"path": rel_norm, "path_obj": local_path})
+            seen.add(rel_norm)
+    for rel_dir in rule.get("include_dirs") or []:
+        rel_dir_norm = str(rel_dir or "").replace("\\", "/").strip().lstrip("/")
+        if not rel_dir_norm:
+            continue
+        local_dir = PROJECT_ROOT / rel_dir_norm
+        if not local_dir.exists() or not local_dir.is_dir():
+            continue
+        for path in local_dir.rglob("*"):
+            if not path.is_file():
+                continue
+            rel_norm = path.relative_to(PROJECT_ROOT).as_posix()
+            if rel_norm in seen or not should_include_batch_update_path(rel_norm, rule):
+                continue
+            files.append({"path": rel_norm, "path_obj": path})
+            seen.add(rel_norm)
+    return sorted(files, key=lambda item: item["path"])
+
+
+def build_batch_update_file_catalog() -> list[dict[str, Any]]:
+    catalog: list[dict[str, Any]] = []
+    for group in BATCH_UPDATE_FILE_GROUPS:
+        files = []
+        for item in iter_batch_update_rule_files(group):
+            local_path = item["path_obj"]
+            files.append(
+                {
+                    "path": item["path"],
+                    "size": local_path.stat().st_size,
+                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(local_path.stat().st_mtime)),
+                }
+            )
+        if files:
+            catalog.append(
+                {
+                    "id": group["id"],
+                    "label": group["label"],
+                    "description": group["description"],
+                    "files": files,
+                }
+            )
+    return catalog
+
+
+def flatten_batch_update_file_catalog() -> list[str]:
+    rel_paths: list[str] = []
+    for group in build_batch_update_file_catalog():
+        for item in group["files"]:
+            rel_paths.append(item["path"])
+    return rel_paths
+
+
+def batch_update_state_path(task_id: str) -> Path:
+    return BATCH_UPDATE_STATE_DIR / f"{task_id}.json"
+
+
+def snapshot_batch_update_task(task: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(task, ensure_ascii=False))
+
+
+def persist_batch_update_task(task: dict[str, Any]) -> None:
+    state_path = batch_update_state_path(task["id"])
+    payload = snapshot_batch_update_task(task)
+    write_json_file(state_path, payload)
+
+
+def update_batch_update_task(task: dict[str, Any], **kwargs: Any) -> None:
+    task.update(kwargs)
+    task["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    persist_batch_update_task(task)
+
+
+def batch_update_task_summary() -> dict[str, Any]:
+    ensure_batch_update_dirs()
+    with _BATCH_UPDATE_LOCK:
+        task = snapshot_batch_update_task(_BATCH_UPDATE_TASK) if _BATCH_UPDATE_TASK else None
+    if task:
+        return {"task": task}
+    latest_state = sorted(BATCH_UPDATE_STATE_DIR.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True)
+    if latest_state:
+        return {"task": read_json_file(latest_state[0], None)}
+    return {"task": None}
 
 def load_runtime_env() -> dict[str, str]:
     if not TRAFFIC_RUNTIME_ENV_PATH.exists():
@@ -255,6 +483,182 @@ def service_status(name: str, use_cache: bool = True) -> dict[str, Any]:
     payload.update(service_autostart_status(name))
     _SERVICE_STATUS_CACHE[name] = (now, payload)
     return dict(payload)
+
+
+def get_local_ipv4_addresses() -> set[str]:
+    addresses = {"127.0.0.1"}
+    result = run_command(["ip", "-br", "addr"], require_root=False, timeout=5)
+    for line in (result.get("stdout") or "").splitlines():
+        for token in line.split():
+            if "/" in token and "." in token:
+                addresses.add(token.split("/", 1)[0].strip())
+    return addresses
+
+
+def import_paramiko_module():
+    try:
+        import paramiko  # type: ignore
+    except Exception as exc:  # pragma: no cover - depends on deployment env
+        search_paths = [
+            "/usr/lib/python3/dist-packages",
+            "/usr/local/lib/python3/dist-packages",
+        ]
+        for path in search_paths:
+            if path not in sys.path and Path(path).exists():
+                sys.path.append(path)
+        try:
+            import paramiko  # type: ignore
+        except Exception:
+            return None, str(exc)
+    return paramiko, ""
+
+
+def remote_connect(target: dict[str, Any]):
+    paramiko, error_text = import_paramiko_module()
+    if paramiko is None:
+        raise RuntimeError(f"当前盒子缺少 paramiko，暂无法执行批量更新：{error_text}")
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        target["host"],
+        port=int(target.get("port") or 22),
+        username=target["username"],
+        password=target.get("password") or None,
+        timeout=10,
+        banner_timeout=10,
+        auth_timeout=10,
+    )
+    return client
+
+
+def remote_exec(client: Any, command: str, timeout: int = 60) -> dict[str, Any]:
+    stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+    out = stdout.read().decode("utf-8", "ignore")
+    err = stderr.read().decode("utf-8", "ignore")
+    code = stdout.channel.recv_exit_status()
+    return {"ok": code == 0, "returncode": code, "stdout": out.strip(), "stderr": err.strip(), "cmd": command}
+
+
+def remote_ensure_parent_dirs(sftp: Any, remote_path: str) -> None:
+    parts: list[str] = []
+    current = Path(remote_path).parent.as_posix()
+    while current not in {"", ".", "/"}:
+        parts.append(current)
+        current = str(Path(current).parent).replace("\\", "/")
+    for path in reversed(parts):
+        try:
+            sftp.stat(path)
+        except IOError:
+            sftp.mkdir(path)
+
+
+def remote_upload_file(client: Any, rel_path: str) -> None:
+    local_path = PROJECT_ROOT / rel_path
+    remote_path = f"/home/nvidia/Project/box_config_tool/{rel_path}"
+    sftp = client.open_sftp()
+    try:
+        remote_ensure_parent_dirs(sftp, remote_path)
+        sftp.put(str(local_path), remote_path)
+    finally:
+        sftp.close()
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def remote_file_sha256(client: Any, rel_path: str) -> str | None:
+    remote_path = f"/home/nvidia/Project/box_config_tool/{rel_path}"
+    command = (
+        f"if [ -f {shlex.quote(remote_path)} ]; then "
+        f"sha256sum {shlex.quote(remote_path)} | awk '{{print $1}}'; "
+        f"fi"
+    )
+    result = remote_exec(client, command, timeout=40)
+    if not result["ok"]:
+        return None
+    value = (result.get("stdout") or "").strip()
+    return value or None
+
+
+def diff_remote_paths(client: Any, rel_paths: list[str]) -> list[str]:
+    changed: list[str] = []
+    for rel_path in rel_paths:
+        local_path = PROJECT_ROOT / rel_path
+        if not local_path.exists() or not local_path.is_file():
+            continue
+        local_hash = file_sha256(local_path)
+        remote_hash = remote_file_sha256(client, rel_path)
+        if remote_hash != local_hash:
+            changed.append(rel_path)
+    return changed
+
+
+def remote_normalize_uploaded_file(client: Any, rel_path: str) -> None:
+    remote_path = f"/home/nvidia/Project/box_config_tool/{rel_path}"
+    commands = [f"sed -i 's/\\r$//' {shlex.quote(remote_path)}"]
+    if rel_path.endswith(".sh") or rel_path.endswith(".desktop"):
+        commands.append(f"chmod +x {shlex.quote(remote_path)}")
+    remote_exec(client, " && ".join(commands), timeout=40)
+
+
+def impacted_services_for_paths(rel_paths: list[str]) -> list[str]:
+    impacted: list[str] = []
+    if any(path.startswith("Box_admin/") for path in rel_paths):
+        impacted.append("box_admin.service")
+    if any(path.startswith("Config_agent/") for path in rel_paths):
+        impacted.append("config_agent.service")
+    if any(path.startswith("Traffic_detect/") or path.startswith("DeepStream-Yolo/") for path in rel_paths):
+        impacted.append("traffic_detect.service")
+    if any(path.startswith("preplan-control-server/") for path in rel_paths):
+        impacted.append("preplan-control.service")
+    return impacted
+
+
+def apply_post_update_actions(client: Any, rel_paths: list[str]) -> list[str]:
+    notes: list[str] = []
+    if "Traffic_detect/traffic_detect.service.example" in rel_paths:
+        install_result = remote_exec(
+            client,
+            "printf '%s\\n' 'nvidia' | sudo -S -p '' install -m 0644 "
+            "/home/nvidia/Project/box_config_tool/Traffic_detect/traffic_detect.service.example "
+            "/etc/systemd/system/traffic_detect.service && "
+            "printf '%s\\n' 'nvidia' | sudo -S -p '' systemctl daemon-reload",
+            timeout=60,
+        )
+        if not install_result["ok"]:
+            raise RuntimeError(install_result["stderr"] or install_result["stdout"] or "更新 traffic_detect.service 失败")
+        notes.append("已同步 traffic_detect.service 模板")
+    return notes
+
+
+def restart_remote_services(client: Any, services: list[str]) -> list[str]:
+    notes: list[str] = []
+    for service_name in services:
+        result = remote_exec(
+            client,
+            f"printf '%s\\n' 'nvidia' | sudo -S -p '' systemctl restart {shlex.quote(service_name)}",
+            timeout=90,
+        )
+        if not result["ok"]:
+            raise RuntimeError(result["stderr"] or result["stdout"] or f"{service_name} 重启失败")
+        notes.append(f"{service_name} 已重启")
+    return notes
+
+
+def verify_remote_box_admin(client: Any) -> dict[str, Any]:
+    result = remote_exec(client, "curl -fsS http://127.0.0.1:8090/api/status", timeout=20)
+    if not result["ok"]:
+        raise RuntimeError(result["stderr"] or result["stdout"] or "配置工具接口校验失败")
+    try:
+        payload = json.loads(result["stdout"])
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"配置工具接口返回不是 JSON：{exc}") from exc
+    return {"hostname": payload.get("hostname"), "ok": payload.get("ok", False)}
 
 
 def mask_to_prefix(mask: str) -> int:
@@ -1662,6 +2066,147 @@ def latest_release_log_bundle() -> Path | None:
     return max(files, key=lambda item: item.stat().st_mtime)
 
 
+def pause_host_heavy_services() -> tuple[list[str], list[str]]:
+    paused: list[str] = []
+    warnings: list[str] = []
+    for service_name in HEAVY_SERVICES:
+        status = service_status(service_name, use_cache=False)
+        if status["status"] not in {"active", "running"}:
+            continue
+        result = run_command(["systemctl", "stop", service_name], require_root=True, timeout=40)
+        if not result["ok"]:
+            warnings.append(result["stderr"] or result["stdout"] or f"{service_name} 暂停失败")
+            continue
+        paused.append(service_name)
+    return paused, warnings
+
+
+def resume_host_heavy_services(services: list[str]) -> tuple[list[str], list[str]]:
+    resumed: list[str] = []
+    warnings: list[str] = []
+    for service_name in services:
+        result = run_command(["systemctl", "start", service_name], require_root=True, timeout=60)
+        if result["ok"]:
+            resumed.append(service_name)
+        else:
+            warnings.append(result["stderr"] or result["stdout"] or f"{service_name} 恢复失败")
+    return resumed, warnings
+
+
+def sort_batch_update_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    local_ips = get_local_ipv4_addresses()
+
+    def _sort_key(item: dict[str, Any]):
+        is_self = item.get("host") in local_ips
+        return (1 if is_self else 0, item.get("group") or "", item.get("name") or item.get("host") or "")
+
+    return sorted(targets, key=_sort_key)
+
+
+def is_local_batch_update_target(target: dict[str, Any]) -> bool:
+    return (target.get("host") or "").strip() in get_local_ipv4_addresses()
+
+
+def run_batch_update_task(task_id: str, selected_targets: list[dict[str, Any]], rel_paths: list[str], options: dict[str, Any]) -> None:
+    global _BATCH_UPDATE_TASK
+    task = {
+        "id": task_id,
+        "status": "running",
+        "message": "批量更新进行中",
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "selected_files": rel_paths,
+        "options": options,
+        "targets": [
+            {
+                "id": item["id"],
+                "name": item.get("name") or item.get("host"),
+                "host": item.get("host"),
+                "status": "pending",
+                "step": "等待开始",
+                "message": "",
+                "notes": [],
+            }
+            for item in sort_batch_update_targets(selected_targets)
+        ],
+        "host_controls": {"paused_services": [], "resumed_services": [], "warnings": []},
+    }
+    with _BATCH_UPDATE_LOCK:
+        _BATCH_UPDATE_TASK = task
+    persist_batch_update_task(task)
+
+    paused_services: list[str] = []
+    try:
+        if options.get("stop_heavy_services"):
+            paused_services, pause_warnings = pause_host_heavy_services()
+            task["host_controls"]["paused_services"] = paused_services
+            task["host_controls"]["warnings"].extend(pause_warnings)
+            update_batch_update_task(task, message="主盒子已切换到轻载更新模式")
+
+        target_map = {item["id"]: item for item in sort_batch_update_targets(selected_targets)}
+        for target_state in task["targets"]:
+            target = target_map[target_state["id"]]
+            target_state["status"] = "running"
+            target_state["step"] = "连接盒子"
+            persist_batch_update_task(task)
+            client = None
+            try:
+                client = remote_connect(target)
+                target_state["step"] = "比对白名单差异"
+                persist_batch_update_task(task)
+                changed_paths = diff_remote_paths(client, rel_paths)
+                target_state["notes"].append(f"检测到 {len(changed_paths)} 个变更文件")
+                if not changed_paths:
+                    target_state["status"] = "ok"
+                    target_state["step"] = "完成"
+                    target_state["message"] = "白名单内没有差异文件，已跳过同步"
+                    persist_batch_update_task(task)
+                    continue
+                target_state["step"] = "同步文件"
+                persist_batch_update_task(task)
+                for rel_path in changed_paths:
+                    remote_upload_file(client, rel_path)
+                    remote_normalize_uploaded_file(client, rel_path)
+                target_state["notes"].extend(apply_post_update_actions(client, changed_paths))
+                services = impacted_services_for_paths(changed_paths)
+                if services:
+                    target_state["step"] = "重启服务"
+                    persist_batch_update_task(task)
+                    target_state["notes"].extend(restart_remote_services(client, services))
+                target_state["step"] = "校验结果"
+                persist_batch_update_task(task)
+                verify_info = verify_remote_box_admin(client)
+                target_state["status"] = "ok"
+                target_state["step"] = "完成"
+                target_state["message"] = f"更新成功，主机名：{verify_info.get('hostname') or '-'}"
+            except Exception as exc:
+                target_state["status"] = "failed"
+                target_state["step"] = "失败"
+                target_state["message"] = str(exc)
+            finally:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
+                persist_batch_update_task(task)
+
+        failed = [item for item in task["targets"] if item["status"] == "failed"]
+        success_count = sum(1 for item in task["targets"] if item["status"] == "ok")
+        task["status"] = "failed" if failed else "ok"
+        task["message"] = f"批量更新完成：成功 {success_count} 台，失败 {len(failed)} 台"
+    except Exception as exc:
+        task["status"] = "failed"
+        task["message"] = f"批量更新中断：{exc}"
+    finally:
+        if options.get("restore_heavy_services") and paused_services:
+            resumed_services, resume_warnings = resume_host_heavy_services(paused_services)
+            task["host_controls"]["resumed_services"] = resumed_services
+            task["host_controls"]["warnings"].extend(resume_warnings)
+        task["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        persist_batch_update_task(task)
+
+
 def read_recent_text_lines(paths: list[Path], limit: int = 160) -> list[str]:
     for path in paths:
         if not path.exists() or not path.is_file():
@@ -2692,6 +3237,76 @@ def api_runtime_diagnostics_download(filename: str):
     if not bundle_path.exists() or not bundle_path.is_file():
         return jsonify({"ok": False, "message": "日志包不存在，请重新导出"}), 404
     return send_file(bundle_path, as_attachment=True, download_name=safe_name)
+
+
+@app.get("/api/batch-update/config")
+def api_batch_update_config():
+    ensure_batch_update_dirs()
+    return jsonify(
+        {
+            "ok": True,
+            "targets": load_batch_update_targets(),
+            "catalog": build_batch_update_file_catalog(),
+            **batch_update_task_summary(),
+        }
+    )
+
+
+@app.post("/api/batch-update/targets")
+def api_batch_update_targets():
+    payload = request.get_json(silent=True) or {}
+    raw_targets = payload.get("targets")
+    if not isinstance(raw_targets, list):
+        return jsonify({"ok": False, "message": "请提供目标盒子列表"}), 400
+    targets = [normalize_batch_update_target(item) for item in raw_targets if isinstance(item, dict)]
+    save_batch_update_targets(targets)
+    return jsonify({"ok": True, "message": f"已保存 {len(targets)} 台目标盒子", "targets": load_batch_update_targets()})
+
+
+@app.get("/api/batch-update/state")
+def api_batch_update_state():
+    ensure_batch_update_dirs()
+    return jsonify({"ok": True, **batch_update_task_summary()})
+
+
+@app.post("/api/batch-update/tasks")
+def api_batch_update_start():
+    payload = request.get_json(silent=True) or {}
+    selected_file_paths = flatten_batch_update_file_catalog()
+    if not selected_file_paths:
+        return jsonify({"ok": False, "message": "当前白名单内没有可同步的文件"}), 400
+
+    target_ids = {str(item).strip() for item in (payload.get("target_ids") or []) if str(item).strip()}
+    saved_targets = load_batch_update_targets()
+    selected_targets = [item for item in saved_targets if item.get("enabled") and item.get("host") and item["id"] in target_ids]
+    if not selected_targets:
+        return jsonify({"ok": False, "message": "请至少选择一台可用盒子"}), 400
+    if any(is_local_batch_update_target(item) for item in selected_targets):
+        return jsonify({"ok": False, "message": "第一版暂不支持把主控盒子自己放进同一轮批量更新，请先只更新其他盒子"}), 400
+
+    with _BATCH_UPDATE_LOCK:
+        if _BATCH_UPDATE_TASK and _BATCH_UPDATE_TASK.get("status") == "running":
+            return jsonify({"ok": False, "message": "当前已有批量更新任务正在执行"}), 409
+
+    options = {
+        "stop_heavy_services": bool((payload.get("options") or {}).get("stop_heavy_services", True)),
+        "restore_heavy_services": bool((payload.get("options") or {}).get("restore_heavy_services", True)),
+    }
+    task_id = uuid.uuid4().hex[:12]
+    worker = threading.Thread(
+        target=run_batch_update_task,
+        args=(task_id, selected_targets, selected_file_paths, options),
+        daemon=True,
+        name=f"batch-update-{task_id}",
+    )
+    worker.start()
+    return jsonify(
+        {
+            "ok": True,
+            "message": f"已开始批量更新，目标 {len(selected_targets)} 台，文件 {len(selected_file_paths)} 项",
+            "task_id": task_id,
+        }
+    )
 
 
 @app.get("/api/signal-controller")

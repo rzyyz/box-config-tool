@@ -5,8 +5,10 @@ const htmlCache = new Map();
 const loadedPages = new Set();
 let activePageKey = panels.find((panel) => panel.classList.contains("active"))?.dataset.pageKey || "network";
 let dataLogRefreshTimer = null;
+let batchUpdatePollTimer = null;
 const DATA_LOG_WINDOW_MINUTES = 30;
 const DATA_LOG_REFRESH_MS = 5000;
+const BATCH_UPDATE_REFRESH_MS = 3000;
 const DATA_LOG_NAV_PRIORITY = {
   network: 0,
   camera: 1,
@@ -16,6 +18,7 @@ const DATA_LOG_NAV_PRIORITY = {
   "step-control": 5,
   "data-log": 6,
   "runtime-log": 7,
+  "batch-update": 8,
 };
 const CTRL_MODE_LABELS = {
   0: "本地时段控制",
@@ -36,6 +39,11 @@ const CTRL_MODE_LABELS = {
   16: "区域优化控制",
   17: "单点优化控制",
   18: "公交优先控制",
+};
+let batchUpdateConfig = {
+  targets: [],
+  catalog: [],
+  task: null,
 };
 
 
@@ -1265,10 +1273,208 @@ function startDataLogAutoRefresh() {
 }
 
 
+function normalizeBatchTarget(item = {}) {
+  return {
+    id: item.id || `target-${Math.random().toString(16).slice(2, 10)}`,
+    name: item.name || "",
+    host: item.host || "",
+    port: Number(item.port || 22),
+    username: item.username || "nvidia",
+    password: item.password || "",
+    enabled: item.enabled !== false,
+    group: item.group || "",
+    remark: item.remark || "",
+  };
+}
+
+
+function renderBatchTargetTable(items) {
+  const root = document.getElementById("batchTargetTableBody");
+  root.innerHTML = "";
+  for (const item of items) {
+    const row = document.createElement("tr");
+    row.dataset.id = item.id;
+    row.innerHTML = `
+      <td><input type="checkbox" data-field="selected" ${item.enabled ? "checked" : ""}></td>
+      <td><input data-field="name" value="${escapeHtml(item.name)}" placeholder="例如 中心测试盒子"></td>
+      <td><input data-field="host" value="${escapeHtml(item.host)}" placeholder="192.168.x.x"></td>
+      <td><input data-field="port" type="number" min="1" max="65535" value="${escapeHtml(item.port || 22)}"></td>
+      <td><input data-field="username" value="${escapeHtml(item.username || "nvidia")}" placeholder="nvidia"></td>
+      <td><input data-field="password" value="${escapeHtml(item.password || "")}" placeholder="密码"></td>
+      <td><input data-field="group" value="${escapeHtml(item.group || "")}" placeholder="例如 信控网A组"></td>
+      <td>
+        <select data-field="enabled">
+          <option value="1" ${item.enabled ? "selected" : ""}>启用</option>
+          <option value="0" ${!item.enabled ? "selected" : ""}>禁用</option>
+        </select>
+      </td>
+      <td><input data-field="remark" value="${escapeHtml(item.remark || "")}" placeholder="备注"></td>
+      <td><button class="btn secondary small batch-target-delete-btn" type="button">删除</button></td>
+    `;
+    row.querySelector(".batch-target-delete-btn").addEventListener("click", () => {
+      row.remove();
+    });
+    root.appendChild(row);
+  }
+}
+
+
+function collectBatchTargets() {
+  return Array.from(document.querySelectorAll("#batchTargetTableBody tr")).map((row) => normalizeBatchTarget({
+    id: row.dataset.id,
+    name: row.querySelector('[data-field="name"]')?.value.trim() || "",
+    host: row.querySelector('[data-field="host"]')?.value.trim() || "",
+    port: row.querySelector('[data-field="port"]')?.value.trim() || "22",
+    username: row.querySelector('[data-field="username"]')?.value.trim() || "nvidia",
+    password: row.querySelector('[data-field="password"]')?.value || "",
+    enabled: (row.querySelector('[data-field="enabled"]')?.value || "1") === "1",
+    group: row.querySelector('[data-field="group"]')?.value.trim() || "",
+    remark: row.querySelector('[data-field="remark"]')?.value.trim() || "",
+  }));
+}
+
+
+function collectSelectedBatchTargetIds() {
+  return Array.from(document.querySelectorAll("#batchTargetTableBody tr"))
+    .filter((row) => row.querySelector('[data-field="selected"]')?.checked)
+    .map((row) => row.dataset.id)
+    .filter(Boolean);
+}
+
+
+function renderBatchUpdateCatalog(catalog) {
+  const root = document.getElementById("batchUpdateCatalog");
+  if (!Array.isArray(catalog) || !catalog.length) {
+    setHtmlIfChanged(root, `<div class="insight-item"><strong>暂未发现可同步的白名单文件</strong><span class="subtle">请先确认源码目录完整，再刷新本页。</span></div>`);
+    return;
+  }
+  const html = catalog.map((group) => {
+    const previewItems = (group.files || []).slice(0, 8).map((item) => `
+      <div class="batch-file-item">
+        <span>
+          <strong>${escapeHtml(item.path)}</strong>
+          <span class="subtle">大小 ${item.size} 字节，最近修改 ${item.updated_at || "-"}</span>
+        </span>
+      </div>
+    `).join("");
+    const extraCount = Math.max((group.files || []).length - 8, 0);
+    return `
+      <div class="insight-item">
+        <strong>${escapeHtml(group.label || "-")}</strong>
+        <span class="subtle">${escapeHtml(group.description || "")}</span>
+        <div class="batch-scope-meta">纳入自动比对：${(group.files || []).length} 个文件${extraCount ? `，以下仅预览前 8 个` : ""}</div>
+        <div class="batch-file-list">${previewItems}</div>
+        ${extraCount ? `<div class="subtle">其余 ${extraCount} 个文件也会自动纳入差异比对，无需手工勾选。</div>` : ""}
+      </div>
+    `;
+  }).join("");
+  setHtmlIfChanged(root, html);
+}
+
+
+function renderBatchUpdateTask(task) {
+  const meta = document.getElementById("batchUpdateTaskMeta");
+  const summary = document.getElementById("batchUpdateTaskSummary");
+  const body = document.getElementById("batchUpdateTaskBody");
+  if (!task) {
+    meta.textContent = "尚未启动批量更新任务。";
+    setHtmlIfChanged(summary, `<div class="summary-item"><span class="label">当前状态</span><span class="value">暂无任务</span></div>`);
+    setHtmlIfChanged(body, `<tr><td colspan="5">暂无任务记录</td></tr>`);
+    return;
+  }
+  meta.textContent = `${task.message || "批量更新已记录"}。最近更新时间 ${task.updated_at || "-"}`;
+  setHtmlIfChanged(summary, `
+    <div class="summary-item"><span class="label">任务编号</span><span class="value">${escapeHtml(task.id || "-")}</span></div>
+    <div class="summary-item"><span class="label">任务状态</span><span class="value">${statusBadge(task.status === "ok" ? "ok" : (task.status === "running" ? "warning" : "failed"), task.status || "-")}</span></div>
+    <div class="summary-item"><span class="label">白名单文件</span><span class="value">${Array.isArray(task.selected_files) ? task.selected_files.length : 0} 项自动纳入差异比对</span></div>
+    <div class="summary-item"><span class="label">主盒子重服务</span><span class="value">暂停：${(task.host_controls?.paused_services || []).join("、") || "无"}；恢复：${(task.host_controls?.resumed_services || []).join("、") || "无"}</span></div>
+    <div class="summary-item"><span class="label">主盒子告警</span><span class="value">${(task.host_controls?.warnings || []).length ? task.host_controls.warnings.map((item) => escapeHtml(item)).join("<br>") : "无"}</span></div>
+  `);
+  const rows = Array.isArray(task.targets) && task.targets.length ? task.targets.map((item) => `
+    <tr>
+      <td>${escapeHtml(item.name || item.host || "-")}<div class="subtle">${escapeHtml(item.host || "-")}</div></td>
+      <td>${statusBadge(item.status === "ok" ? "ok" : (item.status === "running" ? "warning" : item.status === "pending" ? "inactive" : "failed"), item.status || "-")}</td>
+      <td>${escapeHtml(item.step || "-")}</td>
+      <td>${escapeHtml(item.message || "-")}</td>
+      <td>${Array.isArray(item.notes) && item.notes.length ? item.notes.map((note) => escapeHtml(note)).join("<br>") : "-"}</td>
+    </tr>
+  `).join("") : `<tr><td colspan="5">暂无任务记录</td></tr>`;
+  setHtmlIfChanged(body, rows);
+}
+
+
+async function loadBatchUpdateConfig(force = false) {
+  const data = await fetchJson("/api/batch-update/config");
+  batchUpdateConfig = {
+    targets: (data.targets || []).map((item) => normalizeBatchTarget(item)),
+    catalog: data.catalog || [],
+    task: data.task || null,
+  };
+  renderBatchTargetTable(batchUpdateConfig.targets);
+  renderBatchUpdateCatalog(batchUpdateConfig.catalog);
+  renderBatchUpdateTask(batchUpdateConfig.task);
+  const totalFiles = (batchUpdateConfig.catalog || []).reduce((sum, group) => sum + ((group.files || []).length || 0), 0);
+  document.getElementById("batchUpdateMeta").textContent = `已载入 ${batchUpdateConfig.targets.length} 台盒子，白名单范围共 ${totalFiles} 个文件，启动任务时会自动比对并仅同步有差异的文件。`;
+  if (force) {
+    showToast("批量更新配置已刷新", true);
+  }
+}
+
+
+async function saveBatchTargetsSilently() {
+  const targets = collectBatchTargets();
+  const data = await fetchJson("/api/batch-update/targets", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ targets }),
+  });
+  batchUpdateConfig.targets = (data.targets || []).map((item) => normalizeBatchTarget(item));
+  renderBatchTargetTable(batchUpdateConfig.targets);
+  document.getElementById("batchUpdateMeta").textContent = data.message;
+  return data;
+}
+
+
+async function refreshBatchUpdateState() {
+  const data = await fetchJson("/api/batch-update/state");
+  batchUpdateConfig.task = data.task || null;
+  renderBatchUpdateTask(batchUpdateConfig.task);
+}
+
+
+function stopBatchUpdatePolling() {
+  if (batchUpdatePollTimer) {
+    clearInterval(batchUpdatePollTimer);
+    batchUpdatePollTimer = null;
+  }
+}
+
+
+function startBatchUpdatePolling() {
+  stopBatchUpdatePolling();
+  batchUpdatePollTimer = setInterval(async () => {
+    try {
+      await refreshBatchUpdateState();
+      if (!batchUpdateConfig.task || batchUpdateConfig.task.status !== "running") {
+        stopBatchUpdatePolling();
+      }
+    } catch (error) {
+      stopBatchUpdatePolling();
+      showToast(error.message, false);
+    }
+  }, BATCH_UPDATE_REFRESH_MS);
+}
+
+
 function syncLiveRefreshForPage(key) {
   if (key === "data-log") {
     startDataLogAutoRefresh();
     return;
+  }
+  if (key === "batch-update" && batchUpdateConfig.task?.status === "running") {
+    startBatchUpdatePolling();
+  } else {
+    stopBatchUpdatePolling();
   }
   stopDataLogAutoRefresh();
 }
@@ -1286,6 +1492,8 @@ async function loadPageData(key, force = false) {
     await loadCalibrationStatus();
   } else if (key === "runtime") {
     await loadRuntimeSummary();
+  } else if (key === "batch-update") {
+    await loadBatchUpdateConfig(force);
   } else if (key === "runtime-log") {
     await loadRuntimeDiagnostics();
   } else if (key === "step-control") {
@@ -1395,6 +1603,65 @@ function wireActions() {
       showToast("数据检测已刷新", true);
     } catch (error) {
       showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("addBatchTargetBtn").addEventListener("click", () => {
+    clearToast();
+    const items = collectBatchTargets();
+    items.push(normalizeBatchTarget());
+    renderBatchTargetTable(items);
+  });
+
+  document.getElementById("saveBatchTargetsBtn").addEventListener("click", async () => {
+    clearToast();
+    try {
+      const data = await saveBatchTargetsSilently();
+      showToast(data.message, true);
+    } catch (error) {
+      showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("refreshBatchUpdateBtn").addEventListener("click", async () => {
+    clearToast();
+    try {
+      loadedPages.delete("batch-update");
+      await loadBatchUpdateConfig(true);
+      loadedPages.add("batch-update");
+    } catch (error) {
+      showToast(error.message, false);
+    }
+  });
+
+  document.getElementById("startBatchUpdateBtn").addEventListener("click", async () => {
+    clearToast();
+    const button = document.getElementById("startBatchUpdateBtn");
+    const previousText = button.textContent;
+    button.disabled = true;
+    button.textContent = "启动中...";
+    try {
+      await saveBatchTargetsSilently();
+      const targetIds = collectSelectedBatchTargetIds();
+      const data = await fetchJson("/api/batch-update/tasks", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          target_ids: targetIds,
+          options: {
+            stop_heavy_services: document.getElementById("batchStopHeavyServices").value === "1",
+            restore_heavy_services: document.getElementById("batchRestoreHeavyServices").value === "1",
+          },
+        }),
+      });
+      showToast(data.message, true);
+      await refreshBatchUpdateState();
+      startBatchUpdatePolling();
+    } catch (error) {
+      showToast(error.message, false);
+    } finally {
+      button.disabled = false;
+      button.textContent = previousText;
     }
   });
 

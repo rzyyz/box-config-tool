@@ -146,6 +146,100 @@
           </article>
         </section>
 
+        <section class="page-panel" data-page-key="batch-update" data-page-title="批量更新">
+          <div class="section-head">
+            <h2>批量更新</h2>
+            <p>把当前盒子作为主控更新器，按需对多台盒子执行增量同步。任务执行时会先让主盒子停掉重服务，任务结束后再恢复。</p>
+          </div>
+          <div class="card-grid two">
+            <article class="card">
+              <div class="section-toolbar">
+                <div>
+                  <h3>目标盒子清单</h3>
+                  <div id="batchUpdateMeta" class="subtle">可在本页维护要批量更新的盒子列表。</div>
+                </div>
+                <div class="actions">
+                  <button id="addBatchTargetBtn" class="btn secondary">新增盒子</button>
+                  <button id="saveBatchTargetsBtn" class="btn primary">保存盒子清单</button>
+                </div>
+              </div>
+              <div class="table-wrap">
+                <table class="data-table compact-table">
+                  <thead>
+                    <tr>
+                      <th>选择</th>
+                      <th>名称</th>
+                      <th>IP</th>
+                      <th>端口</th>
+                      <th>账号</th>
+                      <th>密码</th>
+                      <th>分组</th>
+                      <th>启用</th>
+                      <th>备注</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody id="batchTargetTableBody"></tbody>
+                </table>
+              </div>
+            </article>
+            <article class="card">
+              <div class="section-toolbar">
+                <div>
+                  <h3>自动增量同步范围</h3>
+                  <div class="subtle">客户无需手工选择文件。启动任务时，系统会自动比对白名单内所有文件，只同步真正发生变化的部分。</div>
+                </div>
+                <div class="actions">
+                  <button id="refreshBatchUpdateBtn" class="btn secondary">刷新批量更新页</button>
+                </div>
+              </div>
+              <div id="batchUpdateCatalog" class="insight-stack"></div>
+              <div class="field-grid" style="margin-top: 12px;">
+                <label class="field">
+                  <span>更新前自动停主盒子重服务</span>
+                  <select id="batchStopHeavyServices">
+                    <option value="1" selected>是</option>
+                    <option value="0">否</option>
+                  </select>
+                </label>
+                <label class="field">
+                  <span>更新完成后自动恢复主盒子重服务</span>
+                  <select id="batchRestoreHeavyServices">
+                    <option value="1" selected>是</option>
+                    <option value="0">否</option>
+                  </select>
+                </label>
+              </div>
+              <div class="actions">
+                <button id="startBatchUpdateBtn" class="btn primary">开始批量更新</button>
+              </div>
+            </article>
+          </div>
+          <article class="card">
+            <div class="section-toolbar">
+              <div>
+                <h3>任务进度</h3>
+                <div id="batchUpdateTaskMeta" class="subtle">尚未启动批量更新任务。</div>
+              </div>
+            </div>
+            <div id="batchUpdateTaskSummary" class="summary-list"></div>
+            <div class="table-wrap">
+              <table class="data-table compact-table">
+                <thead>
+                  <tr>
+                    <th>盒子</th>
+                    <th>状态</th>
+                    <th>当前阶段</th>
+                    <th>结果说明</th>
+                    <th>附加记录</th>
+                  </tr>
+                </thead>
+                <tbody id="batchUpdateTaskBody"></tbody>
+              </table>
+            </div>
+          </article>
+        </section>
+
         <section class="page-panel" data-page-key="runtime-log" data-page-title="运行日志">
           <div class="section-head">
             <h2>运行日志</h2>

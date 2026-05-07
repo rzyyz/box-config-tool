@@ -31,8 +31,8 @@ ENABLE_PREPLAN_AUTOSTART="${ENABLE_PREPLAN_AUTOSTART:-1}"
 PREPLAN_INSTALL_OFFLINE_JAVA="${PREPLAN_INSTALL_OFFLINE_JAVA:-1}"
 PREPLAN_AUTO_INSTALL_JAVA="${PREPLAN_AUTO_INSTALL_JAVA:-0}"
 PIP_WHEEL_DIR="${PIP_WHEEL_DIR:-}"
-REQUIRED_IMPORTS=("flask" "fastapi" "uvicorn" "flask_cors")
-REQUIRED_PIP_PACKAGES=("flask" "fastapi" "uvicorn" "flask-cors")
+REQUIRED_IMPORTS=("flask" "fastapi" "uvicorn" "flask_cors" "paramiko")
+REQUIRED_PIP_PACKAGES=("flask" "fastapi" "uvicorn" "flask-cors" "paramiko" "bcrypt" "cryptography" "pynacl")
 OFFLINE_REQUIREMENTS="${OFFLINE_REQUIREMENTS:-}"
 export PYTHONNOUSERSITE=1
 
@@ -422,12 +422,12 @@ Name=Box Admin
 Name[zh_CN]=盒子配置工具
 Comment=打开盒子本地配置页面
 Comment[zh_CN]=打开盒子本地配置页面
-Exec=/bin/bash -lc 'exec "${PROJECT_ROOT}/Box_admin/open_box_admin.sh"'
+Exec=/bin/bash -lc 'if [ -x "$HOME/Project/box_config_tool/Box_admin/open_box_admin.sh" ]; then exec "$HOME/Project/box_config_tool/Box_admin/open_box_admin.sh"; elif [ -x "$HOME/Project/盒子内置配置工具/Box_admin/open_box_admin.sh" ]; then exec "$HOME/Project/盒子内置配置工具/Box_admin/open_box_admin.sh"; else exec "$HOME/Project/Box_admin/open_box_admin.sh"; fi'
 Path=${PROJECT_ROOT}/Box_admin
 Icon=preferences-system-network
 Terminal=false
 Categories=Settings;Network;
-StartupNotify=true
+StartupNotify=false
 EOF
 
   install -m 0755 "$desktop_tmp" "${SERVICE_HOME}/Desktop/box_admin.desktop"
