@@ -31,4 +31,4 @@ else
 fi
 
 cd "$SCRIPT_DIR"
-exec python main.py
+exec python watchdog_main.py
