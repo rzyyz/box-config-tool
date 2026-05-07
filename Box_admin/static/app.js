@@ -856,6 +856,91 @@ function updateDataLogAutoRefreshBadge(message, status = "warn") {
 }
 
 
+function sampleSeriesEveryFiveSeconds(series, aggregate = "avg") {
+  const safeSeries = Array.isArray(series) ? series.filter((item) => Number.isFinite(Number(item?.ts)) && Number.isFinite(Number(item?.value))) : [];
+  if (!safeSeries.length) {
+    return [];
+  }
+  const buckets = new Map();
+  safeSeries.forEach((item) => {
+    const bucketTs = Math.floor(Number(item.ts) / 5) * 5;
+    const current = buckets.get(bucketTs) || {
+      ts: bucketTs,
+      label: item.label || "",
+      values: [],
+    };
+    current.label = item.label || current.label;
+    current.values.push(Number(item.value));
+    buckets.set(bucketTs, current);
+  });
+  return Array.from(buckets.values())
+    .sort((a, b) => a.ts - b.ts)
+    .map((item) => {
+      const total = item.values.reduce((sum, value) => sum + value, 0);
+      const value = aggregate === "sum" ? total : total / Math.max(item.values.length, 1);
+      return {
+        ts: item.ts,
+        label: item.label,
+        value: Number(value.toFixed(2)),
+      };
+    });
+}
+
+
+function smoothSeries(series, window = 3) {
+  const safeSeries = Array.isArray(series) ? series : [];
+  if (!safeSeries.length) {
+    return [];
+  }
+  const values = safeSeries.map((item) => Number(item.value) || 0);
+  const smoothed = movingAverage(values, window);
+  return safeSeries.map((item, index) => ({
+    ts: item.ts,
+    label: item.label,
+    value: smoothed[index],
+  }));
+}
+
+
+function buildSparklineAxisLabels(series) {
+  if (!Array.isArray(series) || !series.length) {
+    return null;
+  }
+  const start = series[0]?.label || "-";
+  const middle = series[Math.floor((series.length - 1) / 2)]?.label || "-";
+  const end = series[series.length - 1]?.label || "-";
+  return { start, middle, end };
+}
+
+
+function shortTimeLabel(label) {
+  const text = String(label || "").trim();
+  if (!text) {
+    return "-";
+  }
+  const match = text.match(/(\d{2}:\d{2})(:\d{2})?$/);
+  return match ? match[1] : text;
+}
+
+
+function movingAverage(values, window = 5) {
+  if (!Array.isArray(values) || !values.length) {
+    return [];
+  }
+  const safeWindow = Math.max(1, Number(window) || 1);
+  const result = [];
+  let running = 0;
+  values.forEach((value, index) => {
+    running += Number(value) || 0;
+    if (index >= safeWindow) {
+      running -= Number(values[index - safeWindow]) || 0;
+    }
+    result.push(Number((running / Math.min(index + 1, safeWindow)).toFixed(2)));
+  });
+  return result;
+}
+
+
 function buildSparklinePoints(series, width = 180, height = 56, padding = 5, scale = null) {
   const safeSeries = Array.isArray(series) ? series.filter((item) => Number.isFinite(Number(item?.value))) : [];
   if (!safeSeries.length) {
@@ -897,20 +982,26 @@ function buildSparklinePoints(series, width = 180, height = 56, padding = 5, sca
 function renderSparkline(series, options = {}) {
   const width = options.width || 180;
   const height = options.height || 56;
-  const secondarySeries = Array.isArray(options.secondarySeries) ? options.secondarySeries : [];
-  const allValues = [...(series || []), ...secondarySeries]
+  const aggregate = options.aggregate || "avg";
+  const sampledPrimary = smoothSeries(sampleSeriesEveryFiveSeconds(series, aggregate), options.smoothWindow || 3);
+  const sampledSecondary = smoothSeries(
+    sampleSeriesEveryFiveSeconds(Array.isArray(options.secondarySeries) ? options.secondarySeries : [], aggregate),
+    options.smoothWindow || 3,
+  );
+  const allValues = [...sampledPrimary, ...sampledSecondary]
     .map((item) => Number(item?.value))
     .filter((value) => Number.isFinite(value));
   const sharedScale = allValues.length
     ? { min: Math.min(...allValues), max: Math.max(...allValues) }
     : null;
-  const primary = buildSparklinePoints(series, width, height, 5, sharedScale);
+  const primary = buildSparklinePoints(sampledPrimary, width, height, 5, sharedScale);
   if (!primary.polyline) {
     return `<div class="sparkline-box"><div class="subtle">暂无趋势</div></div>`;
   }
-  const secondary = buildSparklinePoints(secondarySeries, width, height, 5, sharedScale);
+  const secondary = buildSparklinePoints(sampledSecondary, width, height, 5, sharedScale);
   const minValue = metricNumber(primary.min);
   const maxValue = metricNumber(primary.max);
+  const axisLabels = buildSparklineAxisLabels(sampledPrimary);
   return `
     <div class="sparkline-box">
       <svg class="sparkline" viewBox="0 0 ${width} ${height}" role="img" aria-label="${escapeHtml(options.label || "趋势图")}">
@@ -919,7 +1010,14 @@ function renderSparkline(series, options = {}) {
         <polyline class="line-primary" points="${primary.polyline}"></polyline>
         ${secondary.polyline ? `<polyline class="line-secondary" points="${secondary.polyline}"></polyline>` : ""}
       </svg>
-      <div class="sparkline-meta">最低 ${minValue}${options.unit || ""} / 最高 ${maxValue}${options.unit || ""}</div>
+      <div class="sparkline-meta">每 5 秒 1 个点，已平滑。最低 ${minValue}${options.unit || ""} / 最高 ${maxValue}${options.unit || ""}</div>
+      ${axisLabels ? `
+        <div class="sparkline-axis">
+          <span>${escapeHtml(shortTimeLabel(axisLabels.start))}</span>
+          <span>${escapeHtml(shortTimeLabel(axisLabels.middle))}</span>
+          <span>${escapeHtml(shortTimeLabel(axisLabels.end))}</span>
+        </div>
+      ` : ""}
     </div>
   `;
 }
